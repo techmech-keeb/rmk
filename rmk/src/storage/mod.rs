@@ -32,6 +32,9 @@ use crate::{BUILD_HASH, config};
 /// True if the flash operation is finished correctly, false if the flash operation is finished with error.
 pub(crate) static FLASH_OPERATION_FINISHED: Signal<crate::RawMutex, bool> = Signal::new();
 
+// VENDOR PATCH (olsk60): Firmware owns the layout and versioning of this opaque block.
+pub const USER_DATA_SIZE: usize = 32;
+
 // Request/response over `FLASH_CHANNEL`. One `Signal` per read variant; the
 // storage task fires the matching one once it has the result.
 #[cfg(feature = "_ble")]
@@ -83,11 +86,18 @@ pub(crate) async fn write_peer_address(addr: PeerAddress) -> bool {
     FLASH_OPERATION_FINISHED.wait().await
 }
 
+// VENDOR PATCH (olsk60): Route writes through the storage task to preserve its flash behavior.
+pub async fn save_user_data(data: [u8; USER_DATA_SIZE]) {
+    FLASH_CHANNEL.send(FlashOperationMessage::UserData(data)).await;
+}
+
 // Message send from other tasks, which will do saving or clearing operation
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum FlashOperationMessage {
+    // VENDOR PATCH (olsk60): Opaque firmware-owned data to be persisted.
+    UserData([u8; USER_DATA_SIZE]),
     #[cfg(feature = "_ble")]
     // BLE profile info to be saved
     ProfileInfo(ProfileInfo),
@@ -202,6 +212,8 @@ pub(crate) enum StorageKey {
     ActiveBleProfile,
     #[cfg(feature = "_ble")]
     BondInfo(u8),
+    // VENDOR PATCH (olsk60): Serialized explicitly as 0xE0 for compatibility with existing flash data.
+    UserData,
 }
 
 impl StorageKey {
@@ -243,12 +255,21 @@ impl StorageKey {
 
 impl Key for StorageKey {
     fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, SerializationError> {
+        // VENDOR PATCH (olsk60): Keep the vendor key independent of postcard enum discriminants.
+        if *self == Self::UserData {
+            *buffer.first_mut().ok_or(SerializationError::BufferTooSmall)? = 0xE0;
+            return Ok(1);
+        }
         postcard::to_slice(self, buffer)
             .map(|used| used.len())
             .map_err(Into::into)
     }
 
     fn deserialize_from(buffer: &[u8]) -> Result<(Self, usize), SerializationError> {
+        // VENDOR PATCH (olsk60): Recognize the stable vendor key before decoding snapshot keys.
+        if buffer.first() == Some(&0xE0) {
+            return Ok((Self::UserData, 1));
+        }
         let (key, rest): (Self, &[u8]) = postcard::take_from_bytes(buffer).map_err(SerializationError::from)?;
         Ok((key, buffer.len() - rest.len()))
     }
@@ -283,6 +304,8 @@ pub(crate) enum StorageData {
     BondInfo(ProfileInfo),
     #[cfg(feature = "_ble")]
     ActiveBleProfile(u8),
+    // VENDOR PATCH (olsk60): The payload is encoded as the same raw postcard array used by RMK 0.8.2.
+    UserData([u8; USER_DATA_SIZE]),
 }
 
 impl<'a> PostcardValue<'a> for StorageData {}
@@ -401,6 +424,17 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
     Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>
 {
     async fn fetch_data(&mut self, key: StorageKey) -> Option<StorageData> {
+        // VENDOR PATCH (olsk60): Decode the vendor payload without an enum tag for on-flash compatibility.
+        if key == StorageKey::UserData {
+            return match self.flash.fetch_item(&mut self.buffer, &key).await {
+                Ok(Some(data)) => Some(StorageData::UserData(data)),
+                Ok(None) => None,
+                Err(e) => {
+                    print_storage_error::<F>(e);
+                    None
+                }
+            };
+        }
         match self.flash.fetch_item(&mut self.buffer, &key).await {
             Ok(data) => data,
             Err(e) => {
@@ -411,7 +445,19 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
     }
 
     async fn store_data(&mut self, key: StorageKey, data: &StorageData) -> Result<(), SSError<F::Error>> {
+        // VENDOR PATCH (olsk60): Encode the vendor payload without an enum tag for on-flash compatibility.
+        if let (StorageKey::UserData, StorageData::UserData(data)) = (key, data) {
+            return self.flash.store_item(&mut self.buffer, &key, data).await;
+        }
         self.flash.store_item(&mut self.buffer, &key, data).await
+    }
+
+    // VENDOR PATCH (olsk60): Read the opaque block during firmware startup.
+    pub async fn read_user_data(&mut self) -> Option<[u8; USER_DATA_SIZE]> {
+        match self.fetch_data(StorageKey::UserData).await {
+            Some(StorageData::UserData(data)) => Some(data),
+            _ => None,
+        }
     }
 
     pub async fn new(
@@ -663,6 +709,11 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
             debug!("Flash operation: {:?}", info);
 
             let write_result: Result<(), SSError<F::Error>> = match info {
+                // VENDOR PATCH (olsk60): Persist user data on the existing serialized flash path.
+                FlashOperationMessage::UserData(data) => {
+                    self.store_data(StorageKey::UserData, &StorageData::UserData(data))
+                        .await
+                }
                 #[cfg(feature = "_ble")]
                 FlashOperationMessage::ReadBleBondInfo(slot_num) => {
                     let resp = match self.fetch_data(StorageKey::bond_info(slot_num)).await {
@@ -972,6 +1023,8 @@ mod tests {
     #[test]
     fn storage_key_round_trip() {
         let cases = [
+            // VENDOR PATCH (olsk60): Exercise the stable user-data key through the snapshot key codec.
+            StorageKey::UserData,
             StorageKey::StorageConfig,
             StorageKey::LayoutConfig,
             StorageKey::BehaviorConfig,
@@ -1007,6 +1060,32 @@ mod tests {
             assert_eq!(decoded, key);
             assert_eq!(used, size);
         }
+    }
+
+    // VENDOR PATCH (olsk60): Verify the stable key and raw payload survive a storage round trip.
+    #[test]
+    fn user_data_round_trip_is_bit_compatible() {
+        block_on(async {
+            type Flash = TestFlash<16_384, 4_096, 1>;
+
+            let mut storage = Storage::<Flash, 0, 0, 0, 0> {
+                flash: MapStorage::new(Flash::new(), MapConfig::new(8_192..16_384), Cache::new_uncached()),
+                buffer: [0; get_buffer_size()],
+            };
+            let data = core::array::from_fn(|idx| idx as u8);
+
+            storage
+                .store_data(StorageKey::UserData, &StorageData::UserData(data))
+                .await
+                .unwrap();
+
+            assert_eq!(storage.read_user_data().await, Some(data));
+            let mut key = [0; 1];
+            assert_eq!(StorageKey::UserData.serialize_into(&mut key).unwrap(), 1);
+            assert_eq!(key, [0xE0]);
+            let mut encoded = [0; USER_DATA_SIZE];
+            assert_eq!(postcard::to_slice(&data, &mut encoded).unwrap(), data);
+        });
     }
 
     #[test]
