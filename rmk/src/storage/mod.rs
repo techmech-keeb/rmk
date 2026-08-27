@@ -304,7 +304,12 @@ pub(crate) enum StorageData {
     BondInfo(ProfileInfo),
     #[cfg(feature = "_ble")]
     ActiveBleProfile(u8),
-    // VENDOR PATCH (olsk60): The payload is encoded as the same raw postcard array used by RMK 0.8.2.
+    // VENDOR PATCH (olsk60): Firmware owns the layout and versioning of this opaque
+    // block. The value MUST go through the normal postcard path (i.e. carry its
+    // enum tag): `read_keymap` scans every item in the map and decodes each one as
+    // `StorageData`, so an untagged payload whose first byte is not a valid variant
+    // index aborts that scan. Regression test:
+    // `user_data_item_must_not_break_the_startup_keymap_scan`.
     UserData([u8; USER_DATA_SIZE]),
 }
 
@@ -424,17 +429,6 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
     Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>
 {
     async fn fetch_data(&mut self, key: StorageKey) -> Option<StorageData> {
-        // VENDOR PATCH (olsk60): Decode the vendor payload without an enum tag for on-flash compatibility.
-        if key == StorageKey::UserData {
-            return match self.flash.fetch_item(&mut self.buffer, &key).await {
-                Ok(Some(data)) => Some(StorageData::UserData(data)),
-                Ok(None) => None,
-                Err(e) => {
-                    print_storage_error::<F>(e);
-                    None
-                }
-            };
-        }
         match self.flash.fetch_item(&mut self.buffer, &key).await {
             Ok(data) => data,
             Err(e) => {
@@ -445,10 +439,6 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
     }
 
     async fn store_data(&mut self, key: StorageKey, data: &StorageData) -> Result<(), SSError<F::Error>> {
-        // VENDOR PATCH (olsk60): Encode the vendor payload without an enum tag for on-flash compatibility.
-        if let (StorageKey::UserData, StorageData::UserData(data)) = (key, data) {
-            return self.flash.store_item(&mut self.buffer, &key, data).await;
-        }
         self.flash.store_item(&mut self.buffer, &key, data).await
     }
 
@@ -937,26 +927,28 @@ mod tests {
         }
     }
 
-    struct TestFlash<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> {
+    struct TestFlash<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize, const READ_SIZE: usize = 1> {
         bytes: [u8; SIZE],
     }
 
-    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE> {
+    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize, const READ_SIZE: usize>
+        TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE, READ_SIZE>
+    {
         fn new() -> Self {
             Self { bytes: [0xFF; SIZE] }
         }
     }
 
-    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> embedded_storage::nor_flash::ErrorType
-        for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE>
+    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize, const READ_SIZE: usize>
+        embedded_storage::nor_flash::ErrorType for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE, READ_SIZE>
     {
         type Error = TestFlashError;
     }
 
-    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> embedded_storage::nor_flash::ReadNorFlash
-        for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE>
+    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize, const READ_SIZE: usize>
+        embedded_storage::nor_flash::ReadNorFlash for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE, READ_SIZE>
     {
-        const READ_SIZE: usize = 1;
+        const READ_SIZE: usize = READ_SIZE;
 
         fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
             let start = offset as usize;
@@ -970,8 +962,8 @@ mod tests {
         }
     }
 
-    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> embedded_storage::nor_flash::NorFlash
-        for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE>
+    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize, const READ_SIZE: usize>
+        embedded_storage::nor_flash::NorFlash for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE, READ_SIZE>
     {
         const WRITE_SIZE: usize = WRITE_SIZE;
         const ERASE_SIZE: usize = ERASE_SIZE;
@@ -991,10 +983,10 @@ mod tests {
         }
     }
 
-    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize>
-        embedded_storage_async::nor_flash::ReadNorFlash for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE>
+    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize, const READ_SIZE: usize>
+        embedded_storage_async::nor_flash::ReadNorFlash for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE, READ_SIZE>
     {
-        const READ_SIZE: usize = 1;
+        const READ_SIZE: usize = READ_SIZE;
 
         async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
             embedded_storage::nor_flash::ReadNorFlash::read(self, offset, bytes)
@@ -1005,8 +997,8 @@ mod tests {
         }
     }
 
-    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize>
-        embedded_storage_async::nor_flash::NorFlash for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE>
+    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize, const READ_SIZE: usize>
+        embedded_storage_async::nor_flash::NorFlash for TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE, READ_SIZE>
     {
         const WRITE_SIZE: usize = WRITE_SIZE;
         const ERASE_SIZE: usize = ERASE_SIZE;
@@ -1080,11 +1072,22 @@ mod tests {
                 .unwrap();
 
             assert_eq!(storage.read_user_data().await, Some(data));
+            // The key stays a stable 0xE0 sentinel, independent of the snapshot's
+            // postcard discriminants.
             let mut key = [0; 1];
             assert_eq!(StorageKey::UserData.serialize_into(&mut key).unwrap(), 1);
             assert_eq!(key, [0xE0]);
-            let mut encoded = [0; USER_DATA_SIZE];
-            assert_eq!(postcard::to_slice(&data, &mut encoded).unwrap(), data);
+            // The value, by contrast, must be a normally tagged `StorageData` so the
+            // generic item scan in `read_keymap` can decode it.
+            let mut encoded = [0; USER_DATA_SIZE + 8];
+            let bytes = postcard::to_slice(&StorageData::UserData(data), &mut encoded).unwrap();
+            assert!(
+                matches!(
+                    postcard::from_bytes::<StorageData>(bytes),
+                    Ok(StorageData::UserData(decoded)) if decoded == data
+                ),
+                "stored user data must round-trip through the generic StorageData codec"
+            );
         });
     }
 
@@ -1223,6 +1226,225 @@ mod tests {
             // The freshly built keymap exposes the stored value to the via
             // GET handler.
             assert_eq!(keymap.layout_option(), 42);
+        });
+    }
+    // [REPRO] Device-like conditions for the on-hardware UserData loss:
+    // WRITE_SIZE=4 (RP2040-like), fully populated 6x13x4 map, then a
+    // reinit over the same flash (power cycle equivalent).
+
+    // [REPRO] Exact embassy-rp Flash<Async> geometry: WRITE_SIZE=1, READ_SIZE=4.
+    #[cfg(feature = "host")]
+    #[test]
+    fn user_data_survives_reinit_rp2040_async_geometry() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 1, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+            let data: [u8; USER_DATA_SIZE] = core::array::from_fn(|idx| idx as u8);
+            storage
+                .store_data(StorageKey::UserData, &StorageData::UserData(data))
+                .await
+                .unwrap();
+            assert_eq!(storage.read_user_data().await, Some(data), "same-boot readback");
+
+            let (flash, _) = storage.flash.destroy();
+            let mut storage2 = Storage::<Flash, 6, 13, 4, 2>::new(
+                flash,
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+            assert_eq!(storage2.read_user_data().await, Some(data), "post-reboot readback");
+        });
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn user_data_survives_reinit_with_populated_map_write_size_4() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+
+            // Boot 1: fresh flash -> full initialize (new-build first boot).
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+            let data: [u8; USER_DATA_SIZE] = core::array::from_fn(|idx| idx as u8);
+            storage
+                .store_data(StorageKey::UserData, &StorageData::UserData(data))
+                .await
+                .unwrap();
+            assert_eq!(storage.read_user_data().await, Some(data), "same-boot readback");
+
+            // Boot 2: rebuild over the same flash content.
+            let (flash, _) = storage.flash.destroy();
+            let mut storage2 = Storage::<Flash, 6, 13, 4, 2>::new(
+                flash,
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+            assert_eq!(storage2.read_user_data().await, Some(data), "post-reboot readback");
+        });
+    }
+
+    // [REGRESSION] `read_keymap` scans EVERY item in the map and decodes each one
+    // as `StorageData`. When the vendor user-data item was stored without its
+    // postcard enum tag, its magic byte (0x54) was read as an invalid variant
+    // index: the scan returned Err, and `KeyMap::new_from_storage` reacted by
+    // erasing the whole storage region and rebooting. On hardware that destroyed
+    // every setting and the stored keymap on the boot after any settings save.
+    #[cfg(feature = "host")]
+    #[test]
+    fn user_data_item_must_not_break_the_startup_keymap_scan() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 1, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+
+            // Sanity: the startup scan is fine before any user data exists.
+            let mut data = crate::keymap::KeymapData::<6, 13, 4, 2>::new_with_encoder(
+                [[[KeyAction::No; 13]; 6]; 4],
+                [[EncoderAction::default(); 2]; 4],
+            );
+            let mut behavior = RuntimeBehaviorConfig::default();
+            assert!(
+                storage.read_keymap(&mut data, &mut behavior).await.is_ok(),
+                "baseline scan (no user data) must succeed"
+            );
+
+            // Save one user-data block, byte-for-byte as the firmware does: the
+            // olsk60 layout starts with magic 0x54 ('T'), which is NOT a valid
+            // postcard variant index for `StorageData`.
+            let mut user = [0u8; USER_DATA_SIZE];
+            user[..5].copy_from_slice(&[0x54, 0x02, 0x03, 0x02, 0x00]);
+            storage
+                .store_data(StorageKey::UserData, &StorageData::UserData(user))
+                .await
+                .unwrap();
+            assert_eq!(storage.read_user_data().await, Some(user), "user data must read back");
+
+            // The startup scan must still succeed; otherwise the caller wipes flash.
+            assert!(
+                storage.read_keymap(&mut data, &mut behavior).await.is_ok(),
+                "startup keymap scan must tolerate the vendor user-data item"
+            );
+        });
+    }
+    // [REGRESSION] A Vial keymap edit is stored as a *newer* item for a key that
+    // init already wrote. `read_keymap` relies on the map iterator returning the
+    // stale item first and the fresh one last, and on the scan running to
+    // completion -- if the scan aborts early (e.g. on an item it cannot decode)
+    // the newest edits are exactly what gets dropped.
+    #[cfg(feature = "host")]
+    #[test]
+    fn vial_keymap_edit_survives_a_reboot_alongside_user_data() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 1, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+
+            // A settings save, then a Vial edit of one key -- in that order, as on
+            // hardware.
+            let mut user = [0u8; USER_DATA_SIZE];
+            user[..5].copy_from_slice(&[0x54, 0x02, 0x03, 0x02, 0x00]);
+            storage
+                .store_data(StorageKey::UserData, &StorageData::UserData(user))
+                .await
+                .unwrap();
+            let edited = KeyAction::Single(rmk_types::action::Action::Key(rmk_types::keycode::KeyCode::Hid(
+                rmk_types::keycode::HidKeyCode::Kc1,
+            )));
+            storage
+                .store_data(StorageKey::keymap(0, 1, 1), &StorageData::KeyAction(edited))
+                .await
+                .unwrap();
+
+            // Reboot.
+            let (flash, _) = storage.flash.destroy();
+            let mut storage2 = Storage::<Flash, 6, 13, 4, 2>::new(
+                flash,
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+
+            let mut data = crate::keymap::KeymapData::<6, 13, 4, 2>::new_with_encoder(
+                [[[KeyAction::No; 13]; 6]; 4],
+                [[EncoderAction::default(); 2]; 4],
+            );
+            let mut behavior = RuntimeBehaviorConfig::default();
+            storage2
+                .read_keymap(&mut data, &mut behavior)
+                .await
+                .expect("startup keymap scan must succeed");
+            assert_eq!(data.keymap[0][1][1], edited, "the Vial edit must survive a reboot");
+            assert_eq!(
+                storage2.read_user_data().await,
+                Some(user),
+                "user data must survive too"
+            );
         });
     }
 }
