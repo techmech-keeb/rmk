@@ -82,12 +82,27 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
             .await
             .map_err(|e| print_storage_error::<F>(e))?;
 
-        // Read all keymap keys and encoder configs
-        while let Some((key, item)) = key_iterator
-            .next::<StorageData>(&mut self.buffer)
-            .await
-            .map_err(|e| print_storage_error::<F>(e))?
-        {
+        // Read all keymap keys and encoder configs.
+        //
+        // VENDOR PATCH (olsk60): tolerate items whose *value* does not decode as
+        // `StorageData` by skipping them instead of aborting the whole scan. The
+        // iterator visits every item ever written; a single foreign entry (a
+        // legacy encoding, or data written by a newer firmware) used to turn one
+        // undecodable value into an Err here — and the caller then treated the
+        // entire storage as unreadable. Real flash I/O errors still propagate.
+        loop {
+            let (key, item) = match key_iterator.next::<StorageData>(&mut self.buffer).await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(sequential_storage::Error::SerializationError(e)) => {
+                    warn!("Skipping storage item that does not decode as StorageData: {:?}", e);
+                    continue;
+                }
+                Err(e) => {
+                    print_storage_error::<F>(e);
+                    return Err(());
+                }
+            };
             match (key, item) {
                 (StorageKey::Keymap { layer, row, col }, StorageData::KeyAction(action)) => {
                     let layer = layer as usize;
