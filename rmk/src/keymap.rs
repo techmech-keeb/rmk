@@ -5,10 +5,7 @@ use rmk_types::action::{EncoderAction, KeyAction};
 use rmk_types::fork::Fork;
 use rmk_types::morse::{Morse, MorseProfile};
 #[cfg(all(feature = "storage", feature = "host"))]
-use {
-    crate::{boot::reboot_keyboard, storage::Storage},
-    embedded_storage_async::nor_flash::NorFlash,
-};
+use {crate::storage::Storage, embedded_storage_async::nor_flash::NorFlash};
 
 use crate::MACRO_SPACE_SIZE;
 use crate::config::{BehaviorConfig, Hand, MouseKeyConfig, OneShotModifiersConfig, PositionalConfig};
@@ -427,9 +424,13 @@ impl<'a> KeyMap<'a> {
             }
             .is_err()
         {
-            error!("Failed to read from storage, clearing...");
-            storage.flash.erase_all().await.ok();
-            reboot_keyboard();
+            // VENDOR PATCH (olsk60): Do NOT erase on a read failure. A single item
+            // that fails to decode (e.g. a foreign or future-format entry) used to
+            // destroy every stored keymap and setting here, and the reboot hid the
+            // event from any in-RAM diagnostics. Keep the data, fall back to the
+            // compiled-in defaults for whatever could not be read, and let the user
+            // reset deliberately (Vial EepromReset / a `clear_storage` build).
+            error!("Failed to read from storage; keeping flash contents and using defaults");
         }
 
         Self::build(data, behavior, positional_config)
