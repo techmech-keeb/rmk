@@ -1447,4 +1447,81 @@ mod tests {
             );
         });
     }
+    // [MIGRATION] A device that saved settings with the *old* untagged encoding
+    // still carries that item after the fix, because the item is only superseded,
+    // never removed. `read_keymap` must skip it and keep scanning: before the
+    // skip existed, the scan stopped there and every item written after it --
+    // notably later Vial edits -- was silently dropped (2026-08 hardware
+    // regression). The legacy *value* stays unreadable (settings fall back to
+    // defaults once) and the next tagged save supersedes it.
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_legacy_untagged_user_data_item_is_skipped_by_the_scan() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 1, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+
+            // Write the pre-fix, untagged payload exactly as the old code did.
+            let mut legacy = [0u8; USER_DATA_SIZE];
+            legacy[..5].copy_from_slice(&[0x54, 0x02, 0x03, 0x02, 0x00]);
+            storage
+                .flash
+                .store_item(&mut storage.buffer, &StorageKey::UserData, &legacy)
+                .await
+                .unwrap();
+
+            // A later Vial edit lands after it.
+            let edited = KeyAction::Single(rmk_types::action::Action::Key(rmk_types::keycode::KeyCode::Hid(
+                rmk_types::keycode::HidKeyCode::Kc1,
+            )));
+            storage
+                .store_data(StorageKey::keymap(0, 1, 1), &StorageData::KeyAction(edited))
+                .await
+                .unwrap();
+
+            let mut data = crate::keymap::KeymapData::<6, 13, 4, 2>::new_with_encoder(
+                [[[KeyAction::No; 13]; 6]; 4],
+                [[EncoderAction::default(); 2]; 4],
+            );
+            let mut behavior = RuntimeBehaviorConfig::default();
+            storage
+                .read_keymap(&mut data, &mut behavior)
+                .await
+                .expect("the scan must skip the legacy item and run to completion");
+            assert_eq!(
+                data.keymap[0][1][1], edited,
+                "the edit written after the legacy item must be applied"
+            );
+
+            // The legacy value itself is unreadable -- the firmware falls back to
+            // defaults -- and the next (tagged) save supersedes it for good.
+            assert_eq!(storage.read_user_data().await, None, "legacy value is not decodable");
+            let mut user = [0u8; USER_DATA_SIZE];
+            user[..5].copy_from_slice(&[0x54, 0x02, 0x03, 0x02, 0x00]);
+            storage
+                .store_data(StorageKey::UserData, &StorageData::UserData(user))
+                .await
+                .unwrap();
+            assert_eq!(
+                storage.read_user_data().await,
+                Some(user),
+                "tagged save supersedes the legacy item"
+            );
+        });
+    }
 }
