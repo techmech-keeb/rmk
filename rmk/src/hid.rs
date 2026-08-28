@@ -173,8 +173,30 @@ mod steno_tests {
     }
 }
 
+/// The report id of the Resolution Multiplier feature report on the USB
+/// composite interface (`CompositeReport`). Distinct from every
+/// [`CompositeReportType`] input id; hosts negotiate hi-res scrolling by
+/// writing this report (see `usb::UsbCompositeRequestHandler`).
+pub(crate) const RESOLUTION_MULTIPLIER_REPORT_ID: u8 = 0x05;
+
+/// The physical maximum declared for the Resolution Multiplier features.
+/// MUST match the descriptor's `physical_max`; the descriptor byte test pins
+/// both to the same value. Lives here (not in `usb`) because the descriptor
+/// does, and `_no_usb` builds still compile this file.
+pub const RESOLUTION_MULTIPLIER_MAX: u8 = 12;
+
 /// A composite hid report which contains mouse, consumer, system reports.
 /// Report id is used to distinguish from them.
+///
+/// VENDOR PATCH (olsk60, hi-res scroll): Wheel and AC Pan each live in a
+/// LOGICAL collection together with a Resolution Multiplier feature (usage
+/// 0x48, logical 0..=1, physical 1..=12), per HID Usage Tables' rule that the
+/// multiplier applies to the controls sharing its logical collection — a bare
+/// feature in the physical collection would be read as applying to X/Y too.
+/// The feature fields use report id [`RESOLUTION_MULTIPLIER_REPORT_ID`] and
+/// report_count 1 each (Linux ignores multiplier fields with count != 1).
+/// The BLE report map is unchanged: hi-res is USB-only until the HID-over-GATT
+/// feature characteristic exists (design doc §5.4).
 #[gen_hid_descriptor(
     (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = MOUSE) = {
         (collection = PHYSICAL, usage = POINTER) = {
@@ -189,14 +211,24 @@ mod steno_tests {
                     (usage = Y,) = {
                         #[item_settings(data,variable,relative)] y=input;
                     };
-                    (usage = WHEEL,) = {
-                        #[item_settings(data,variable,relative)] wheel=input;
-                    };
                 };
-                (usage_page = CONSUMER,) = {
-                    (usage = AC_PAN,) = {
-                        #[item_settings(data,variable,relative)] pan=input;
-                    };
+            };
+            (collection = LOGICAL, usage_page = GENERIC_DESKTOP, usage = WHEEL) = {
+                (report_id = 0x05, usage = 0x48, logical_min = 0, logical_max = 1,
+                 physical_min = 1, physical_max = 12) = {
+                    #[item_settings(data,variable,absolute)] wheel_multiplier=feature;
+                };
+                (report_id = 0x02, usage = WHEEL,) = {
+                    #[item_settings(data,variable,relative)] wheel=input;
+                };
+            };
+            (collection = LOGICAL, usage_page = CONSUMER, usage = AC_PAN) = {
+                (report_id = 0x05, usage_page = GENERIC_DESKTOP, usage = 0x48, logical_min = 0,
+                 logical_max = 1, physical_min = 1, physical_max = 12) = {
+                    #[item_settings(data,variable,absolute)] pan_multiplier=feature;
+                };
+                (report_id = 0x02, usage_page = CONSUMER, usage = AC_PAN,) = {
+                    #[item_settings(data,variable,relative)] pan=input;
                 };
             };
         };
@@ -225,6 +257,11 @@ pub struct CompositeReport {
     pub(crate) pan: i8,   // Scroll left (negative) or right (positive) this many units
     pub(crate) media_usage_id: u16,
     pub(crate) system_usage_id: u8,
+    // Feature-report fields: only `desc()` sees them. The wire payloads keep
+    // being serialized from `MouseReport` etc., and the feature values are
+    // exchanged over control transfers by the request handler.
+    pub(crate) wheel_multiplier: u8,
+    pub(crate) pan_multiplier: u8,
 }
 
 /// The BLE report map: everything in one HID service, distinguished by report id.
@@ -330,6 +367,83 @@ mod ble_report_map_tests {
             if report_id == 0x01 {
                 assert!(keyboard < id, "keyboard collection must own ReportID 1");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolution_multiplier_descriptor_tests {
+    use usbd_hid::descriptor::SerializedDescriptor;
+
+    use super::{CompositeReport, RESOLUTION_MULTIPLIER_MAX, RESOLUTION_MULTIPLIER_REPORT_ID};
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    /// Pins the hi-res half of the composite descriptor. The physical range
+    /// bytes are built from `RESOLUTION_MULTIPLIER_MAX`, so descriptor and
+    /// handler cannot drift apart without failing here.
+    #[test]
+    fn composite_descriptor_declares_two_resolution_multipliers() {
+        let desc = CompositeReport::desc();
+
+        // Two logical collections, one per scrolling axis.
+        assert_eq!(count(desc, &[0xa1, 0x02]), 2, "logical collections");
+        // Two Resolution Multiplier usages and two feature items.
+        assert_eq!(count(desc, &[0x09, 0x48]), 2, "RMV usages");
+        assert_eq!(count(desc, &[0xb1, 0x02]), 2, "feature items");
+        // Both features share the dedicated report id.
+        assert_eq!(
+            count(desc, &[0x85, RESOLUTION_MULTIPLIER_REPORT_ID]),
+            2,
+            "feature report ids"
+        );
+        // Physical 1..=MAX on the features...
+        assert_eq!(
+            count(desc, &[0x35, 0x01, 0x45, RESOLUTION_MULTIPLIER_MAX]),
+            2,
+            "physical range must equal RESOLUTION_MULTIPLIER_MAX"
+        );
+        // ...and reset to 0/0 afterwards so it cannot leak into the inputs
+        // (global items are sticky; usbd-hid #93's emitter guarantees this).
+        assert_eq!(count(desc, &[0x35, 0x00, 0x45, 0x00]), 2, "physical resets");
+
+        // The mouse input report keeps its id and its relative wheel/pan.
+        assert!(
+            count(desc, &[0x85, 0x02]) >= 2,
+            "mouse report id re-emitted for the inputs"
+        );
+        assert_eq!(count(desc, &[0x09, 0x38]), 2, "wheel usage on collection and input");
+        // Media/system input ids are untouched.
+        assert_eq!(count(desc, &[0x85, 0x03]), 1);
+        assert_eq!(count(desc, &[0x85, 0x04]), 1);
+    }
+
+    /// The feature must come before its input inside each logical collection
+    /// (the multiplier applies to the controls declared after it in the
+    /// collection; this is also the layout of the Microsoft reference).
+    #[test]
+    fn multiplier_feature_precedes_its_input() {
+        let desc = CompositeReport::desc();
+        let mut i = 0;
+        for _ in 0..2 {
+            let coll = desc[i..]
+                .windows(2)
+                .position(|w| w == [0xa1, 0x02])
+                .expect("collection")
+                + i;
+            let feat = desc[coll..]
+                .windows(2)
+                .position(|w| w == [0xb1, 0x02])
+                .expect("feature")
+                + coll;
+            let input = desc[coll..]
+                .windows(2)
+                .position(|w| w == [0x81, 0x06])
+                .expect("relative input")
+                + coll;
+            assert!(feat < input, "feature before input in the collection");
+            i = coll + 2;
         }
     }
 }
