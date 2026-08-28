@@ -1086,9 +1086,12 @@ mod tests {
         }
     }
 
-    // VENDOR PATCH (olsk60): Verify the stable key and raw payload survive a storage round trip.
+    // VENDOR PATCH (olsk60): Verify the stable key and the tagged value survive a
+    // storage round trip. The payload is deliberately NOT byte-compatible with the
+    // 0.8.2-era untagged encoding: carrying the enum tag is what keeps the startup
+    // scan working.
     #[test]
-    fn user_data_round_trip_is_bit_compatible() {
+    fn user_data_round_trips_through_the_tagged_codec() {
         block_on(async {
             type Flash = TestFlash<16_384, 4_096, 1>;
 
@@ -1260,11 +1263,10 @@ mod tests {
             assert_eq!(keymap.layout_option(), 42);
         });
     }
-    // [REPRO] Device-like conditions for the on-hardware UserData loss:
-    // WRITE_SIZE=4 (RP2040-like), fully populated 6x13x4 map, then a
-    // reinit over the same flash (power cycle equivalent).
-
-    // [REPRO] Exact embassy-rp Flash<Async> geometry: WRITE_SIZE=1, READ_SIZE=4.
+    // [REPRO] Device-like conditions for the on-hardware UserData loss: a fully
+    // populated 6x13x4 map, then a reinit over the same flash (power cycle
+    // equivalent). This one uses the exact embassy-rp Flash<Async> geometry
+    // (WRITE_SIZE=1, READ_SIZE=4); the next one uses WRITE_SIZE=4.
     #[cfg(feature = "host")]
     #[test]
     fn user_data_survives_reinit_rp2040_async_geometry() {
