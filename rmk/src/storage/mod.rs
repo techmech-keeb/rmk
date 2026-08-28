@@ -443,10 +443,25 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
     }
 
     // VENDOR PATCH (olsk60): Read the opaque block during firmware startup.
-    pub async fn read_user_data(&mut self) -> Option<[u8; USER_DATA_SIZE]> {
-        match self.fetch_data(StorageKey::UserData).await {
-            Some(StorageData::UserData(data)) => Some(data),
-            _ => None,
+    //
+    // `Ok(None)` means nothing has been saved yet; `Err(())` means the item is
+    // there but could not be read (flash error, or a value this firmware cannot
+    // decode -- e.g. one written by an older or newer settings layout). The
+    // caller falls back to its defaults either way, but only the second case is
+    // worth reporting, and conflating them once made a settings-loss bug much
+    // harder to diagnose. Details are logged by `print_storage_error`.
+    pub async fn read_user_data(&mut self) -> Result<Option<[u8; USER_DATA_SIZE]>, ()> {
+        match self.flash.fetch_item(&mut self.buffer, &StorageKey::UserData).await {
+            Ok(Some(StorageData::UserData(data))) => Ok(Some(data)),
+            Ok(Some(_)) => {
+                warn!("Ignoring the stored user data: it does not hold user data");
+                Err(())
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                print_storage_error::<F>(e);
+                Err(())
+            }
         }
     }
 
@@ -1075,7 +1090,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(storage.read_user_data().await, Some(data));
+            assert_eq!(storage.read_user_data().await, Ok(Some(data)));
             // The key stays a stable 0xE0 sentinel, independent of the snapshot's
             // postcard discriminants.
             let mut key = [0; 1];
@@ -1264,7 +1279,7 @@ mod tests {
                 .store_data(StorageKey::UserData, &StorageData::UserData(data))
                 .await
                 .unwrap();
-            assert_eq!(storage.read_user_data().await, Some(data), "same-boot readback");
+            assert_eq!(storage.read_user_data().await, Ok(Some(data)), "same-boot readback");
 
             let (flash, _) = storage.flash.destroy();
             let mut storage2 = Storage::<Flash, 6, 13, 4, 2>::new(
@@ -1275,7 +1290,7 @@ mod tests {
                 &RuntimeBehaviorConfig::default(),
             )
             .await;
-            assert_eq!(storage2.read_user_data().await, Some(data), "post-reboot readback");
+            assert_eq!(storage2.read_user_data().await, Ok(Some(data)), "post-reboot readback");
         });
     }
 
@@ -1307,7 +1322,7 @@ mod tests {
                 .store_data(StorageKey::UserData, &StorageData::UserData(data))
                 .await
                 .unwrap();
-            assert_eq!(storage.read_user_data().await, Some(data), "same-boot readback");
+            assert_eq!(storage.read_user_data().await, Ok(Some(data)), "same-boot readback");
 
             // Boot 2: rebuild over the same flash content.
             let (flash, _) = storage.flash.destroy();
@@ -1319,7 +1334,7 @@ mod tests {
                 &RuntimeBehaviorConfig::default(),
             )
             .await;
-            assert_eq!(storage2.read_user_data().await, Some(data), "post-reboot readback");
+            assert_eq!(storage2.read_user_data().await, Ok(Some(data)), "post-reboot readback");
         });
     }
 
@@ -1371,7 +1386,11 @@ mod tests {
                 .store_data(StorageKey::UserData, &StorageData::UserData(user))
                 .await
                 .unwrap();
-            assert_eq!(storage.read_user_data().await, Some(user), "user data must read back");
+            assert_eq!(
+                storage.read_user_data().await,
+                Ok(Some(user)),
+                "user data must read back"
+            );
 
             // The startup scan must still succeed; otherwise the caller wipes flash.
             assert!(
@@ -1446,7 +1465,7 @@ mod tests {
             assert_eq!(data.keymap[0][1][1], edited, "the Vial edit must survive a reboot");
             assert_eq!(
                 storage2.read_user_data().await,
-                Some(user),
+                Ok(Some(user)),
                 "user data must survive too"
             );
         });
@@ -1514,7 +1533,11 @@ mod tests {
 
             // The legacy value itself is unreadable -- the firmware falls back to
             // defaults -- and the next (tagged) save supersedes it for good.
-            assert_eq!(storage.read_user_data().await, None, "legacy value is not decodable");
+            assert_eq!(
+                storage.read_user_data().await,
+                Err(()),
+                "the legacy value is reported as unreadable, not as absent"
+            );
             let mut user = [0u8; USER_DATA_SIZE];
             user[..5].copy_from_slice(&[0x54, 0x02, 0x03, 0x02, 0x00]);
             storage
@@ -1523,7 +1546,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 storage.read_user_data().await,
-                Some(user),
+                Ok(Some(user)),
                 "tagged save supersedes the legacy item"
             );
         });
