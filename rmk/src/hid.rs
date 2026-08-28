@@ -183,7 +183,7 @@ pub(crate) const RESOLUTION_MULTIPLIER_REPORT_ID: u8 = 0x05;
 /// MUST match the descriptor's `physical_max`; the descriptor byte test pins
 /// both to the same value. Lives here (not in `usb`) because the descriptor
 /// does, and `_no_usb` builds still compile this file.
-pub const RESOLUTION_MULTIPLIER_MAX: u8 = 12;
+pub(crate) const RESOLUTION_MULTIPLIER_MAX: u8 = 12;
 
 /// A composite hid report which contains mouse, consumer, system reports.
 /// Report id is used to distinguish from them.
@@ -195,8 +195,8 @@ pub const RESOLUTION_MULTIPLIER_MAX: u8 = 12;
 /// feature in the physical collection would be read as applying to X/Y too.
 /// The feature fields use report id [`RESOLUTION_MULTIPLIER_REPORT_ID`] and
 /// report_count 1 each (Linux ignores multiplier fields with count != 1).
-/// The BLE report map is unchanged: hi-res is USB-only until the HID-over-GATT
-/// feature characteristic exists (design doc §5.4).
+/// The BLE report map is unchanged: hi-res is USB-only, because the BLE HID
+/// service has no feature-report characteristic to negotiate through.
 #[gen_hid_descriptor(
     (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = MOUSE) = {
         (collection = PHYSICAL, usage = POINTER) = {
@@ -361,6 +361,13 @@ mod ble_report_map_tests {
             haystack.windows(needle.len()).position(|w| w == needle)
         }
         assert_eq!(desc.len(), 178, "update HidService's report_map size on change");
+        // Hi-res is USB-only: the BLE map must carry no logical collections
+        // and no Resolution Multiplier usages.
+        assert!(
+            !desc.windows(2).any(|w| w == [0xa1, 0x02]),
+            "no logical collection in BLE map"
+        );
+        assert!(!desc.windows(2).any(|w| w == [0x09, 0x48]), "no RMV usage in BLE map");
         let keyboard = find(desc, &[0x09, 0x06]).expect("missing Usage Keyboard");
         for report_id in 1u8..=4 {
             let id = find(desc, &[0x85, report_id]).unwrap_or_else(|| panic!("missing ReportID {report_id}"));
@@ -419,9 +426,33 @@ mod resolution_multiplier_descriptor_tests {
         assert_eq!(count(desc, &[0x85, 0x04]), 1);
     }
 
-    /// The feature must come before its input inside each logical collection
-    /// (the multiplier applies to the controls declared after it in the
-    /// collection; this is also the layout of the Microsoft reference).
+    /// Pins the COMPLETE descriptor byte-for-byte. Substring counting alone
+    /// cannot prove an item sits in the right collection or report, so any
+    /// change to the emitter, the macro input or usbd-hid shows up here as an
+    /// explicit diff to review (BLE pins its map the same way, by length).
+    #[test]
+    fn composite_descriptor_bytes_are_pinned() {
+        let expected: [u8; 182] = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x85, 0x02, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08,
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x17, 0x81, 0xff, 0xff,
+            0xff, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0x09, 0x31, 0x81, 0x06, 0x05, 0x01, 0x09, 0x38, 0xa1,
+            0x02, 0x09, 0x48, 0x85, 0x05, 0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x0c, 0xb1, 0x02, 0x35, 0x00, 0x45,
+            0x00, 0x09, 0x38, 0x85, 0x02, 0x17, 0x81, 0xff, 0xff, 0xff, 0x25, 0x7f, 0x81, 0x06, 0xc0, 0x05, 0x0c, 0x0a,
+            0x38, 0x02, 0xa1, 0x02, 0x05, 0x01, 0x09, 0x48, 0x85, 0x05, 0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x0c,
+            0xb1, 0x02, 0x35, 0x00, 0x45, 0x00, 0x05, 0x0c, 0x0a, 0x38, 0x02, 0x85, 0x02, 0x17, 0x81, 0xff, 0xff, 0xff,
+            0x25, 0x7f, 0x81, 0x06, 0xc0, 0xc0, 0xc0, 0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x03, 0x05, 0x0c, 0x19,
+            0x00, 0x2a, 0x14, 0x05, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00, 0x75, 0x10, 0x81, 0x00, 0xc0, 0x05, 0x01,
+            0x09, 0x80, 0xa1, 0x01, 0x85, 0x04, 0x19, 0x01, 0x29, 0xb7, 0x15, 0x01, 0x26, 0xff, 0x00, 0x75, 0x08, 0x81,
+            0x00, 0xc0,
+        ];
+        assert_eq!(CompositeReport::desc(), expected);
+    }
+
+    /// Pins the reference layout: feature first, then its input, inside each
+    /// logical collection. Declaration order is NOT a spec requirement (hosts
+    /// associate by collection membership, not order — Linux uses the
+    /// collection index), but this is the Microsoft reference layout and the
+    /// one every host is tested against, so keep it stable on purpose.
     #[test]
     fn multiplier_feature_precedes_its_input() {
         let desc = CompositeReport::desc();
