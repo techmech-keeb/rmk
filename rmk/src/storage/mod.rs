@@ -554,6 +554,10 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
             .await
             .map_err(|e| print_storage_error::<F>(e))?;
 
+        if read_data.is_some() && !matches!(read_data, Some(StorageData::BehaviorConfig(_))) {
+            // VENDOR PATCH (olsk60): See `host::storage::read_macro_cache`.
+            warn!("Ignoring the stored behavior config: it does not hold a behavior config");
+        }
         if let Some(StorageData::BehaviorConfig(c)) = read_data {
             behavior_config.morse.prior_idle_time = Duration::from_millis(c.prior_idle_time as u64);
             behavior_config.morse.default_profile = c.morse_default_profile;
