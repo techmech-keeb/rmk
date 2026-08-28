@@ -84,18 +84,30 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
 
         // Read all keymap keys and encoder configs.
         //
-        // VENDOR PATCH (olsk60): tolerate items whose *value* does not decode as
-        // `StorageData` by skipping them instead of aborting the whole scan. The
-        // iterator visits every item ever written; a single foreign entry (a
-        // legacy encoding, or data written by a newer firmware) used to turn one
-        // undecodable value into an Err here — and the caller then treated the
-        // entire storage as unreadable. Real flash I/O errors still propagate.
+        // VENDOR PATCH (olsk60): tolerate items that do not decode by skipping them
+        // instead of aborting the whole scan. The iterator visits every item ever
+        // written; a single foreign entry (a legacy encoding, or data written by a
+        // newer firmware) used to turn one undecodable item into an Err here — and
+        // the caller then treated the entire storage as unreadable. Real flash I/O
+        // errors still propagate.
+        //
+        // The error covers BOTH halves of an item: `MapItemIter::next` decodes the
+        // key first and the value second, and reports either failure as the same
+        // `SerializationError` (sequential-storage 8.0.1). So this arm also skips
+        // items whose *key* is unknown to this firmware, which is what makes a
+        // downstream key namespace survive an upstream scan.
+        //
+        // Known limitation: the error carries no key, so when the newest item for a
+        // key fails to decode, an older item for the same key that the scan already
+        // applied stays in effect (the iterator yields stale items before fresh
+        // ones). Resetting just that key to its default would need an iterator that
+        // reports the key alongside a value-decode failure.
         loop {
             let (key, item) = match key_iterator.next::<StorageData>(&mut self.buffer).await {
                 Ok(Some(entry)) => entry,
                 Ok(None) => break,
                 Err(sequential_storage::Error::SerializationError(e)) => {
-                    warn!("Skipping storage item that does not decode as StorageData: {:?}", e);
+                    warn!("Skipping a storage item whose key or value does not decode: {}", e);
                     continue;
                 }
                 Err(e) => {
