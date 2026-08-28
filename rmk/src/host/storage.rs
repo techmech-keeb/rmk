@@ -137,6 +137,13 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
                     // Restore the VIA/Vial layout options selection
                     data.layout_option = config.layout_option;
                 }
+                // VENDOR PATCH (olsk60): A key this scan owns, carrying a value of
+                // the wrong kind, means the item is unusable -- say so instead of
+                // dropping it silently. The remaining keys belong to the other
+                // readers and are skipped here as a matter of course.
+                (StorageKey::Keymap { .. } | StorageKey::Encoder { .. } | StorageKey::LayoutConfig, _) => {
+                    warn!("Ignoring a storage item whose value does not match its key");
+                }
                 _ => continue,
             }
         }
@@ -151,8 +158,12 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
             .await
             .map_err(|e| print_storage_error::<F>(e))?;
 
-        if let Some(StorageData::MacroData(data)) = read_data {
-            macro_cache.copy_from_slice(&data);
+        match read_data {
+            Some(StorageData::MacroData(data)) => macro_cache.copy_from_slice(&data),
+            // VENDOR PATCH (olsk60): Present but not macro data -- keep the default
+            // and report it rather than ignoring the item without a trace.
+            Some(_) => warn!("Ignoring the stored macro item: it does not hold macro data"),
+            None => {}
         }
 
         Ok(())
@@ -169,9 +180,14 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
                 .await
                 .map_err(|e| print_storage_error::<F>(e))?;
 
-            if let Some(StorageData::Combo(config)) = read_data {
-                debug!("Read combo config: {:?}", config);
-                *item = Some(Combo::new(config));
+            match read_data {
+                Some(StorageData::Combo(config)) => {
+                    debug!("Read combo config: {:?}", config);
+                    *item = Some(Combo::new(config));
+                }
+                // VENDOR PATCH (olsk60): See `read_macro_cache`.
+                Some(_) => warn!("Ignoring a stored combo item: it does not hold a combo"),
+                None => {}
             }
         }
 
@@ -187,8 +203,11 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
                 .await
                 .map_err(|e| print_storage_error::<F>(e))?;
 
-            if let Some(StorageData::Fork(fork)) = read_data {
-                *item = fork;
+            match read_data {
+                Some(StorageData::Fork(fork)) => *item = fork,
+                // VENDOR PATCH (olsk60): See `read_macro_cache`.
+                Some(_) => warn!("Ignoring a stored fork item: it does not hold a fork"),
+                None => {}
             }
         }
 
@@ -204,8 +223,11 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
                 .await
                 .map_err(|e| print_storage_error::<F>(e))?;
 
-            if let Some(StorageData::Morse(morse)) = read_data {
-                *item = morse;
+            match read_data {
+                Some(StorageData::Morse(morse)) => *item = morse,
+                // VENDOR PATCH (olsk60): See `read_macro_cache`.
+                Some(_) => warn!("Ignoring a stored morse item: it does not hold a morse"),
+                None => {}
             }
         }
 
