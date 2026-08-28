@@ -658,20 +658,18 @@ impl RequestHandler for UsbRequestHandler {
 // plain detent behavior. The stored value is the raw logical one so the
 // descriptor's physical range stays the single source of the mapping.
 
-/// Raw logical multiplier values (0 or 1), wheel and pan. Written only by
-/// `UsbCompositeRequestHandler` and the USB lifecycle reset.
-static WHEEL_MULTIPLIER_RAW: AtomicU8 = AtomicU8::new(0);
-static PAN_MULTIPLIER_RAW: AtomicU8 = AtomicU8::new(0);
+/// Raw logical multiplier values packed into one atomic (bit 0 = wheel,
+/// bit 1 = pan) so the two fields of the feature report stay one coherent
+/// state: a reader can never observe half of a SET_REPORT. Written only by
+/// `UsbCompositeRequestHandler` and the USB lifecycle resets.
+static MULTIPLIERS_RAW: AtomicU8 = AtomicU8::new(0);
 
-/// The wheel multiplier a hi-res sender must divide its units by:
-/// 1 (detent) until the host selects hi-res, then `RESOLUTION_MULTIPLIER_MAX`.
-pub fn wheel_resolution_multiplier() -> u8 {
-    effective_multiplier(WHEEL_MULTIPLIER_RAW.load(Ordering::Relaxed))
-}
-
-/// The pan (horizontal) multiplier; see [`wheel_resolution_multiplier`].
-pub fn pan_resolution_multiplier() -> u8 {
-    effective_multiplier(PAN_MULTIPLIER_RAW.load(Ordering::Relaxed))
+/// The (wheel, pan) multipliers a hi-res sender must divide its units by,
+/// taken from a single load: 1 (detent) until the host selects hi-res, then
+/// `RESOLUTION_MULTIPLIER_MAX` per axis.
+pub fn resolution_multipliers() -> (u8, u8) {
+    let raw = MULTIPLIERS_RAW.load(Ordering::Relaxed);
+    (effective_multiplier(raw & 1), effective_multiplier((raw >> 1) & 1))
 }
 
 /// HID Usage Tables' resolution mapping for logical 0..=1 / physical 1..=MAX:
@@ -680,11 +678,11 @@ fn effective_multiplier(raw: u8) -> u8 {
     1 + raw.min(1) * (crate::hid::RESOLUTION_MULTIPLIER_MAX - 1)
 }
 
-/// Back to multiplier 1. Called on USB reset / deconfiguration: the host must
-/// renegotiate after either, and an unrenegotiated device must scroll detent.
+/// Back to multiplier 1. Called when the USB connection's state ends (reset,
+/// deconfiguration, disable): the host must renegotiate afterwards, and an
+/// unrenegotiated device must scroll detent.
 pub(crate) fn reset_resolution_multipliers() {
-    WHEEL_MULTIPLIER_RAW.store(0, Ordering::Relaxed);
-    PAN_MULTIPLIER_RAW.store(0, Ordering::Relaxed);
+    MULTIPLIERS_RAW.store(0, Ordering::Relaxed);
 }
 
 /// Request handler for the composite interface: the one place feature
@@ -694,14 +692,16 @@ pub(crate) struct UsbCompositeRequestHandler {}
 
 impl RequestHandler for UsbCompositeRequestHandler {
     fn get_report(&mut self, id: ReportId, buf: &mut [u8]) -> Option<usize> {
-        // Numbered reports carry their id as the first byte of the control
-        // data stage (HID 1.11 §7.2.1); Linux and Windows both expect it.
+        // A numbered report always carries its id as a one-byte prefix, in
+        // control transfers too (HID 1.11 §8.1); Linux even issues this GET
+        // before every SET to preserve the other field.
         if id != ReportId::Feature(crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID) || buf.len() < 3 {
             return None;
         }
+        let raw = MULTIPLIERS_RAW.load(Ordering::Relaxed);
         buf[0] = crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID;
-        buf[1] = WHEEL_MULTIPLIER_RAW.load(Ordering::Relaxed);
-        buf[2] = PAN_MULTIPLIER_RAW.load(Ordering::Relaxed);
+        buf[1] = raw & 1;
+        buf[2] = (raw >> 1) & 1;
         Some(3)
     }
 
@@ -709,21 +709,18 @@ impl RequestHandler for UsbCompositeRequestHandler {
         if id != ReportId::Feature(crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID) {
             return OutResponse::Rejected;
         }
-        // Accept the payload with or without the leading report id: hosts send
-        // it (HID 1.11 §7.2.2) but a stack that strips it must still work.
-        let payload = match data {
-            [id, rest @ ..] if *id == crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID && rest.len() == 2 => rest,
-            rest if rest.len() == 2 => rest,
-            _ => return OutResponse::Rejected,
+        // Exactly the wire format of the numbered report: [id, wheel, pan]
+        // (HID 1.11 §8.1; embassy-usb hands the data stage over unmodified).
+        // Out-of-range values are rejected rather than clamped: silently
+        // coercing would let host and device disagree on the rate.
+        let [report_id, wheel, pan] = *data else {
+            return OutResponse::Rejected;
         };
-        // Reject out-of-range values instead of clamping (design doc §5.3):
-        // silently coercing would let host and device disagree on the rate.
-        if payload[0] > 1 || payload[1] > 1 {
+        if report_id != crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID || wheel > 1 || pan > 1 {
             return OutResponse::Rejected;
         }
-        WHEEL_MULTIPLIER_RAW.store(payload[0], Ordering::Relaxed);
-        PAN_MULTIPLIER_RAW.store(payload[1], Ordering::Relaxed);
-        info!("Resolution multiplier set: wheel={} pan={}", payload[0], payload[1]);
+        MULTIPLIERS_RAW.store(wheel | (pan << 1), Ordering::Relaxed);
+        info!("Resolution multiplier set: wheel={} pan={}", wheel, pan);
         OutResponse::Accepted
     }
 }
@@ -746,6 +743,9 @@ impl UsbDeviceHandler {
 
 impl Handler for UsbDeviceHandler {
     fn enabled(&mut self, enabled: bool) {
+        if !enabled {
+            reset_resolution_multipliers();
+        }
         if enabled {
             info!("Device enabled");
             set_usb_state(UsbState::Enabled);
@@ -916,22 +916,31 @@ mod resolution_multiplier_tests {
 
         // Before any SET: logical min, effective multiplier 1 (plain detent).
         assert_eq!(get(&mut handler), [RESOLUTION_MULTIPLIER_REPORT_ID, 0, 0]);
-        assert_eq!(wheel_resolution_multiplier(), 1);
-        assert_eq!(pan_resolution_multiplier(), 1);
+        assert_eq!(resolution_multipliers(), (1, 1));
 
-        // Hosts send the payload with the report id prefixed (HID 1.11 §7.2.2).
+        // The one wire format of the numbered report (HID 1.11 §8.1).
         assert_eq!(
             handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
             OutResponse::Accepted
         );
         assert_eq!(get(&mut handler), [RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]);
-        assert_eq!(wheel_resolution_multiplier(), RESOLUTION_MULTIPLIER_MAX);
-        assert_eq!(pan_resolution_multiplier(), RESOLUTION_MULTIPLIER_MAX);
+        assert_eq!(
+            resolution_multipliers(),
+            (RESOLUTION_MULTIPLIER_MAX, RESOLUTION_MULTIPLIER_MAX)
+        );
 
-        // A stack that strips the id must work too, and the axes are independent.
-        assert_eq!(handler.set_report(FEATURE, &[1, 0]), OutResponse::Accepted);
-        assert_eq!(wheel_resolution_multiplier(), RESOLUTION_MULTIPLIER_MAX);
-        assert_eq!(pan_resolution_multiplier(), 1);
+        // The axes are independent, and the pair comes from one load: any
+        // accepted SET is observed whole, never as a half-updated mix.
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 0]),
+            OutResponse::Accepted
+        );
+        assert_eq!(resolution_multipliers(), (RESOLUTION_MULTIPLIER_MAX, 1));
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 0, 1]),
+            OutResponse::Accepted
+        );
+        assert_eq!(resolution_multipliers(), (1, RESOLUTION_MULTIPLIER_MAX));
 
         reset_resolution_multipliers();
     }
@@ -945,19 +954,20 @@ mod resolution_multiplier_tests {
             &[][..],                                         // empty
             &[1][..],                                        // too short
             &[RESOLUTION_MULTIPLIER_REPORT_ID][..],          // id only
+            &[1, 1][..],                                     // no report id prefix
+            &[RESOLUTION_MULTIPLIER_REPORT_ID, 1][..],       // one field missing
             &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1, 0][..], // too long
-            &[2, 0][..],                                     // wheel out of range
-            &[0, 7][..],                                     // pan out of range
-            &[RESOLUTION_MULTIPLIER_REPORT_ID, 2, 0][..],    // out of range, prefixed
+            &[0x77, 1, 1][..],                               // wrong id prefix
+            &[RESOLUTION_MULTIPLIER_REPORT_ID, 2, 0][..],    // wheel out of range
+            &[RESOLUTION_MULTIPLIER_REPORT_ID, 0, 7][..],    // pan out of range
         ] {
             assert_eq!(handler.set_report(FEATURE, bad), OutResponse::Rejected, "{bad:?}");
-            assert_eq!(wheel_resolution_multiplier(), 1, "state untouched by {bad:?}");
-            assert_eq!(pan_resolution_multiplier(), 1);
+            assert_eq!(resolution_multipliers(), (1, 1), "state untouched by {bad:?}");
         }
 
         // Wrong report id, and non-feature ids, are rejected outright.
         assert_eq!(
-            handler.set_report(ReportId::Feature(0x77), &[1, 1]),
+            handler.set_report(ReportId::Feature(0x77), &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
             OutResponse::Rejected
         );
         assert!(handler.get_report(ReportId::Feature(0x77), &mut [0u8; 8]).is_none());
@@ -965,16 +975,33 @@ mod resolution_multiplier_tests {
     }
 
     #[test]
+    fn get_needs_room_for_the_whole_numbered_report() {
+        reset_resolution_multipliers();
+        let mut handler = UsbCompositeRequestHandler::default();
+        for len in 0..3usize {
+            let mut buf = [0u8; 3];
+            assert!(
+                handler.get_report(FEATURE, &mut buf[..len]).is_none(),
+                "a {len}-byte buffer cannot hold the report; reject, don't truncate"
+            );
+        }
+        let mut buf = [0u8; 3];
+        assert_eq!(handler.get_report(FEATURE, &mut buf), Some(3));
+    }
+
+    #[test]
     fn usb_lifecycle_reset_drops_back_to_detent() {
         reset_resolution_multipliers();
         let mut handler = UsbCompositeRequestHandler::default();
-        assert_eq!(handler.set_report(FEATURE, &[1, 1]), OutResponse::Accepted);
-        assert_eq!(wheel_resolution_multiplier(), RESOLUTION_MULTIPLIER_MAX);
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
+            OutResponse::Accepted
+        );
+        assert_eq!(resolution_multipliers().0, RESOLUTION_MULTIPLIER_MAX);
 
-        // What UsbDeviceHandler::reset / configured(false) call.
+        // What UsbDeviceHandler::reset, configured(false) and enabled(false) call.
         reset_resolution_multipliers();
-        assert_eq!(wheel_resolution_multiplier(), 1);
-        assert_eq!(pan_resolution_multiplier(), 1);
+        assert_eq!(resolution_multipliers(), (1, 1));
     }
 
     /// The keyboard-side handler must never accept a feature write: the gate
@@ -982,7 +1009,10 @@ mod resolution_multiplier_tests {
     #[test]
     fn keyboard_interface_rejects_feature_reports() {
         let mut handler = UsbRequestHandler::default();
-        assert_eq!(handler.set_report(FEATURE, &[1, 1]), OutResponse::Rejected);
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
+            OutResponse::Rejected
+        );
         assert_eq!(handler.set_report(ReportId::Feature(0x00), &[]), OutResponse::Rejected);
         // Non-feature writes keep the existing accepting behavior.
         assert_eq!(handler.set_report(ReportId::Out(0), &[0x02]), OutResponse::Accepted);
