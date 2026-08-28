@@ -86,10 +86,20 @@ pub(crate) async fn write_peer_address(addr: PeerAddress) -> bool {
     FLASH_OPERATION_FINISHED.wait().await
 }
 
-// VENDOR PATCH (olsk60): Route writes through the storage task to preserve its flash behavior.
-pub async fn save_user_data(data: [u8; USER_DATA_SIZE]) {
+// VENDOR PATCH (olsk60): Route writes through the storage task to preserve its
+// flash behavior, and wait for that task to finish the write.
+//
+// Returns `true` once the item is on flash. The dedicated signal matters: the
+// shared `FLASH_OPERATION_FINISHED` reports whichever operation the task
+// completed, so a Vial write queued ahead of this one could be mistaken for our
+// own result (`FLASH_CHANNEL` holds several messages).
+pub async fn save_user_data(data: [u8; USER_DATA_SIZE]) -> bool {
+    USER_DATA_SAVED.reset();
     FLASH_CHANNEL.send(FlashOperationMessage::UserData(data)).await;
+    USER_DATA_SAVED.wait().await
 }
+
+static USER_DATA_SAVED: Signal<crate::RawMutex, bool> = Signal::new();
 
 // Message send from other tasks, which will do saving or clearing operation
 #[allow(clippy::large_enum_variant)]
@@ -720,8 +730,11 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
             let write_result: Result<(), SSError<F::Error>> = match info {
                 // VENDOR PATCH (olsk60): Persist user data on the existing serialized flash path.
                 FlashOperationMessage::UserData(data) => {
-                    self.store_data(StorageKey::UserData, &StorageData::UserData(data))
-                        .await
+                    let result = self
+                        .store_data(StorageKey::UserData, &StorageData::UserData(data))
+                        .await;
+                    USER_DATA_SAVED.signal(result.is_ok());
+                    result
                 }
                 #[cfg(feature = "_ble")]
                 FlashOperationMessage::ReadBleBondInfo(slot_num) => {
@@ -1470,6 +1483,211 @@ mod tests {
             );
         });
     }
+    // [REGRESSION] An item stored under a key this firmware does not know must not
+    // stop the scan. `MapItemIter::next` decodes the key first and reports a failed
+    // key decode as the same `SerializationError` as a failed value decode, so the
+    // skip covers both -- which is what would let an upstream firmware tolerate a
+    // downstream key namespace.
+    #[cfg(feature = "host")]
+    #[test]
+    fn an_item_under_an_unknown_key_is_skipped_by_the_scan() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 1, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+            let storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+
+            // 0xE1 is not a key this firmware can decode: the vendor codec only
+            // claims 0xE0, and postcard rejects the rest.
+            #[derive(Debug, Clone, PartialEq, Eq)]
+            struct UnknownKey;
+            impl Key for UnknownKey {
+                fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, SerializationError> {
+                    *buffer.first_mut().ok_or(SerializationError::BufferTooSmall)? = 0xE1;
+                    Ok(1)
+                }
+                fn deserialize_from(_buffer: &[u8]) -> Result<(Self, usize), SerializationError> {
+                    Ok((UnknownKey, 1))
+                }
+            }
+            assert!(
+                StorageKey::deserialize_from(&[0xE1]).is_err(),
+                "0xE1 must be undecodable for this firmware, or the test proves nothing"
+            );
+
+            let mut foreign = MapStorage::<UnknownKey, _, _>::new(
+                storage.flash.destroy().0,
+                MapConfig::new(0..8 * 4_096),
+                Cache::new_uncached(),
+            );
+            let mut buffer = [0u8; get_buffer_size()];
+            foreign.store_item(&mut buffer, &UnknownKey, &[0u8; 8]).await.unwrap();
+
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                foreign.destroy().0,
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+            let edited = KeyAction::Single(rmk_types::action::Action::Key(rmk_types::keycode::KeyCode::Hid(
+                rmk_types::keycode::HidKeyCode::Kc1,
+            )));
+            storage
+                .store_data(StorageKey::keymap(0, 1, 1), &StorageData::KeyAction(edited))
+                .await
+                .unwrap();
+
+            let mut data = crate::keymap::KeymapData::<6, 13, 4, 2>::new_with_encoder(
+                [[[KeyAction::No; 13]; 6]; 4],
+                [[EncoderAction::default(); 2]; 4],
+            );
+            let mut behavior = RuntimeBehaviorConfig::default();
+            storage
+                .read_keymap(&mut data, &mut behavior)
+                .await
+                .expect("an unknown key must not stop the scan");
+            assert_eq!(
+                data.keymap[0][1][1], edited,
+                "items written after the unknown key must still be applied"
+            );
+        });
+    }
+
+    // [UPSTREAM] A stored macro whose byte length no longer matches
+    // `MACRO_SPACE_SIZE` is the one failure an ordinary upstream build can hit:
+    // `[rmk] macro_space_size` in keyboard.toml re-runs the rmk-types build script
+    // but NOT rmk's own, so `BUILD_HASH` stays put and the existing map is treated
+    // as current -- while `macro_bytes_serde` rejects the old length. Note where
+    // the failure surfaces: the scan tolerates the item, but `read_macro_cache`
+    // fetches it by key and propagates the error, so skipping in the scan alone
+    // does not cover this path.
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_macro_item_of_a_different_length_fails_the_keyed_read_but_not_the_scan() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 1, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+
+            // A `MacroData` item as a build with a smaller macro space wrote it:
+            // the variant tag, then postcard's byte string of three bytes.
+            let mut tagged = [0u8; get_buffer_size()];
+            let expected_tag = postcard::to_slice(&StorageData::MacroData([0u8; MACRO_SPACE_SIZE]), &mut tagged)
+                .expect("the buffer holds at least the tag")[0];
+            let short_macro = [expected_tag, 3, 0, 0, 0];
+            storage
+                .flash
+                .store_item(&mut storage.buffer, &StorageKey::MacroData, &short_macro)
+                .await
+                .unwrap();
+
+            let mut data = crate::keymap::KeymapData::<6, 13, 4, 2>::new_with_encoder(
+                [[[KeyAction::No; 13]; 6]; 4],
+                [[EncoderAction::default(); 2]; 4],
+            );
+            let mut behavior = RuntimeBehaviorConfig::default();
+            assert!(
+                storage.read_keymap(&mut data, &mut behavior).await.is_ok(),
+                "the scan skips the item"
+            );
+
+            let mut macro_cache = [0u8; MACRO_SPACE_SIZE];
+            assert!(
+                storage.read_macro_cache(&mut macro_cache).await.is_err(),
+                "the keyed read still fails: this is the path that erases every \
+                 stored keymap and bond on an upstream build"
+            );
+        });
+    }
+
+    // [LIMITATION] The skip has a cost worth pinning down: the iterator yields the
+    // stale item for a key before the fresh one, and the error carries no key, so
+    // when the newest item for a key cannot be decoded the scan keeps the older
+    // value instead of falling back to the compiled default. Fixing this needs an
+    // iterator that reports the key alongside a value-decode failure.
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_stale_item_survives_when_the_newest_one_cannot_be_decoded() {
+        block_on(async {
+            type Flash = TestFlash<32_768, 4_096, 1, 4>;
+            let keymap = [[[KeyAction::No; 13]; 6]; 4];
+            let encoder_map: Option<&mut [[EncoderAction; 2]; 4]> = None;
+            let storage_config = RuntimeStorageConfig {
+                start_addr: 0,
+                num_sectors: 8,
+                clear_storage: false,
+                clear_layout: false,
+            };
+            let mut storage = Storage::<Flash, 6, 13, 4, 2>::new(
+                Flash::new(),
+                &keymap,
+                &encoder_map,
+                &storage_config,
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+
+            // A Vial edit lands first...
+            let stale = KeyAction::Single(rmk_types::action::Action::Key(rmk_types::keycode::KeyCode::Hid(
+                rmk_types::keycode::HidKeyCode::Kc1,
+            )));
+            storage
+                .store_data(StorageKey::keymap(0, 1, 1), &StorageData::KeyAction(stale))
+                .await
+                .unwrap();
+            // ...then a newer item for the same key that this firmware cannot decode
+            // (as a firmware with a different schema would have written it).
+            storage
+                .flash
+                .store_item(&mut storage.buffer, &StorageKey::keymap(0, 1, 1), &[0xFEu8; 6])
+                .await
+                .unwrap();
+
+            let mut data = crate::keymap::KeymapData::<6, 13, 4, 2>::new_with_encoder(
+                [[[KeyAction::No; 13]; 6]; 4],
+                [[EncoderAction::default(); 2]; 4],
+            );
+            let mut behavior = RuntimeBehaviorConfig::default();
+            storage
+                .read_keymap(&mut data, &mut behavior)
+                .await
+                .expect("the scan still completes");
+            assert_eq!(
+                data.keymap[0][1][1], stale,
+                "documented limitation: the older value stays in effect"
+            );
+        });
+    }
+
     // [MIGRATION] A device that saved settings with the *old* untagged encoding
     // still carries that item after the fix, because the item is only superseded,
     // never removed. `read_keymap` must skip it and keep scanning: before the
