@@ -3,8 +3,8 @@ use embassy_futures::select::{Either, select};
 use embassy_sync::signal::Signal;
 #[cfg(feature = "usb_log")]
 use embassy_usb::class::cdc_acm::CdcAcmClass;
-use embassy_usb::class::hid::{HidReader, HidReaderWriter, HidWriter, ReportId, RequestHandler};
-use embassy_usb::control::OutResponse;
+use embassy_usb::class::hid::{HidProtocolMode, HidReader, HidReaderWriter, HidWriter, ReportId, RequestHandler};
+use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::{Driver, EndpointError};
 use embassy_usb::{Builder, Handler, UsbDevice};
 use rmk_types::connection::{ConnectionType, UsbState};
@@ -178,10 +178,13 @@ fn default_config_descriptor() -> &'static mut [u8] {
     &mut CONFIG_DESC.init([0; DEFAULT_CONFIG_DESC_SIZE])[..]
 }
 
+/// `boot_keyboard_interface` is the interface number the caller will give the
+/// boot-subclass keyboard, or `None` when the build has no keyboard interface.
 pub(crate) fn new_usb_builder<'d, D: Driver<'d>>(
     driver: D,
     keyboard_config: DeviceConfig<'d>,
     config_descriptor: &'d mut [u8],
+    boot_keyboard_interface: Option<u8>,
 ) -> Builder<'d, D> {
     let mut usb_config = embassy_usb::Config::new(keyboard_config.vid, keyboard_config.pid);
     usb_config.manufacturer = Some(keyboard_config.manufacturer);
@@ -235,7 +238,7 @@ pub(crate) fn new_usb_builder<'d, D: Driver<'d>>(
     );
 
     static device_handler: StaticCell<UsbDeviceHandler> = StaticCell::new();
-    builder.handler(device_handler.init(UsbDeviceHandler::new()));
+    builder.handler(device_handler.init(UsbDeviceHandler::new(boot_keyboard_interface)));
 
     builder
 }
@@ -312,7 +315,16 @@ impl<D: Driver<'static>> UsbTransportBuilder<D> {
             device_config.serial_number = crate::ble::nrf::get_serial_number();
             device_config
         };
-        let mut builder: Builder<'static, D> = new_usb_builder(driver, device_config, config_descriptor);
+        // The keyboard is the first interface this builder adds, so it takes
+        // interface 0. Adding an interface before it would silently move the
+        // number, which no test catches: `HidReaderWriter::new` does not hand
+        // back the number it was assigned.
+        let mut builder: Builder<'static, D> = new_usb_builder(
+            driver,
+            device_config,
+            config_descriptor,
+            Some(PRIMARY_KEYBOARD_INTERFACE),
+        );
         // Linux's usbhid driver auto-enables power/wakeup when it probes a
         // boot-protocol keyboard, so advertise Boot/Keyboard on the primary
         // HID interface.
@@ -505,7 +517,9 @@ async fn run_usb_logger<D: Driver<'static>>(logger_class: CdcAcmClass<'static, D
 
 #[cfg(any(feature = "usb_log", feature = "dfu_nrf", feature = "dfu_rp"))]
 pub async fn run_peripheral_usb<D: Driver<'static>>(driver: D, config: DeviceConfig<'static>) {
-    let mut builder = new_usb_builder(driver, config, default_config_descriptor());
+    // A peripheral serves only the logger and DFU interfaces, so there is no
+    // boot keyboard whose protocol requests this device would answer.
+    let mut builder = new_usb_builder(driver, config, default_config_descriptor(), None);
 
     #[cfg(feature = "usb_log")]
     let logger_fut = run_usb_logger(add_usb_logger!(&mut builder));
@@ -613,19 +627,45 @@ impl RequestHandler for UsbRequestHandler {
     }
 }
 
+/// The boot keyboard is the first interface [`UsbTransportBuilder::new`] adds,
+/// and `new_usb_builder` adds none, so it is always interface 0.
+const PRIMARY_KEYBOARD_INTERFACE: u8 = 0;
+
+/// HID class request codes (HID 1.11 section 7.2). embassy-usb keeps its own
+/// copies private, and these are the only two this handler answers.
+const HID_REQ_GET_PROTOCOL: u8 = 0x03;
+const HID_REQ_SET_PROTOCOL: u8 = 0x0b;
+
 pub(crate) struct UsbDeviceHandler {
     /// State to restore on resume. Only a Configured device is ever published as
     /// Suspended (see `suspended()`), so this always holds Configured while the
     /// device is suspended; kept as a snapshot rather than a hardcoded value so
     /// resume stays correct if another pre-suspend state becomes publishable.
     pre_suspend: UsbState,
+    /// Interface number of the boot-subclass keyboard, or `None` on a build
+    /// with no keyboard interface. The number identifies which interface's
+    /// SET_PROTOCOL/GET_PROTOCOL this handler answers; without it the same
+    /// class request codes would shadow another class on the device, such as
+    /// DFU's GETSTATUS.
+    boot_keyboard_interface: Option<u8>,
+    /// The protocol mode the host last selected for that interface.
+    protocol: HidProtocolMode,
 }
 
 impl UsbDeviceHandler {
-    fn new() -> Self {
+    fn new(boot_keyboard_interface: Option<u8>) -> Self {
         UsbDeviceHandler {
             pre_suspend: UsbState::Disabled,
+            boot_keyboard_interface,
+            protocol: HidProtocolMode::Report,
         }
+    }
+
+    /// Whether `req` is a class request aimed at the boot keyboard interface.
+    fn targets_boot_keyboard(&self, req: &Request) -> bool {
+        self.boot_keyboard_interface.is_some_and(|iface| {
+            (req.request_type, req.recipient, req.index) == (RequestType::Class, Recipient::Interface, iface as u16)
+        })
     }
 }
 
@@ -641,6 +681,9 @@ impl Handler for UsbDeviceHandler {
     }
 
     fn reset(&mut self) {
+        // "The Boot Keyboard shall, upon reset, return to the non-boot
+        // protocol" (HID 1.11 Appendix F.3).
+        self.protocol = HidProtocolMode::Report;
         info!("Bus reset, the Vbus current limit is 100mA");
     }
 
@@ -656,6 +699,37 @@ impl Handler for UsbDeviceHandler {
             set_usb_state(UsbState::Enabled);
             info!("Device is no longer configured, the Vbus current limit is 100mA.");
         }
+    }
+
+    fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
+        // SET_PROTOCOL. Answered here rather than through the HID class's
+        // `RequestHandler`, which gets no bus-reset callback and so cannot
+        // restore the report protocol.
+        if !self.targets_boot_keyboard(&req) || req.request != HID_REQ_SET_PROTOCOL {
+            return None;
+        }
+        // Reject rather than fall through: the HID class would answer the same
+        // request without checking these fields.
+        let mode = match (req.value, req.length) {
+            (0, 0) => HidProtocolMode::Boot,
+            (1, 0) => HidProtocolMode::Report,
+            _ => return Some(OutResponse::Rejected),
+        };
+        // Accepting Boot needs no change to what we transmit: KeyboardReport is
+        // already the 8-byte boot keyboard layout with no report ID.
+        self.protocol = mode;
+        Some(OutResponse::Accepted)
+    }
+
+    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        if !self.targets_boot_keyboard(&req) || req.request != HID_REQ_GET_PROTOCOL {
+            return None;
+        }
+        if (req.value, req.length) != (0, 1) || buf.is_empty() {
+            return Some(InResponse::Rejected);
+        }
+        buf[0] = self.protocol as u8;
+        Some(InResponse::Accepted(&buf[..1]))
     }
 
     fn suspended(&mut self, suspended: bool) {
@@ -702,10 +776,117 @@ impl Handler for UsbDeviceHandler {
 #[cfg(test)]
 mod tests {
     use embassy_usb::Handler;
+    use embassy_usb::driver::Direction;
     use rmk_types::connection::UsbState;
 
-    use super::UsbDeviceHandler;
+    use super::{
+        HID_REQ_GET_PROTOCOL, HID_REQ_SET_PROTOCOL, InResponse, OutResponse, PRIMARY_KEYBOARD_INTERFACE, Recipient,
+        Request, RequestType, UsbDeviceHandler,
+    };
     use crate::state::{current_usb_state, set_usb_state};
+
+    /// Builds a class request aimed at `iface`.
+    fn class_request(request: u8, value: u16, iface: u16, length: u16) -> Request {
+        Request {
+            direction: Direction::Out,
+            request_type: RequestType::Class,
+            recipient: Recipient::Interface,
+            request,
+            value,
+            index: iface,
+            length,
+        }
+    }
+
+    /// One test for the whole protocol lifecycle: the mode only means anything
+    /// as a sequence of host requests.
+    #[test]
+    fn the_keyboard_interface_honours_set_protocol_and_bus_reset() {
+        let mut handler = UsbDeviceHandler::new(Some(PRIMARY_KEYBOARD_INTERFACE));
+        let mut buf = [0u8; 1];
+
+        let get = class_request(HID_REQ_GET_PROTOCOL, 0, PRIMARY_KEYBOARD_INTERFACE as u16, 1);
+        assert_eq!(handler.control_in(get, &mut buf), Some(InResponse::Accepted(&[1][..])));
+
+        // A BIOS or KVM switch selects the boot protocol before it will use the
+        // keyboard; rejecting it strands a host that trusts the boot subclass.
+        let set_boot = class_request(HID_REQ_SET_PROTOCOL, 0, PRIMARY_KEYBOARD_INTERFACE as u16, 0);
+        assert_eq!(handler.control_out(set_boot, &[]), Some(OutResponse::Accepted));
+        assert_eq!(handler.control_in(get, &mut buf), Some(InResponse::Accepted(&[0][..])));
+
+        // "The Boot Keyboard shall, upon reset, return to the non-boot
+        // protocol" (HID 1.11 Appendix F.3).
+        handler.reset();
+        assert_eq!(handler.control_in(get, &mut buf), Some(InResponse::Accepted(&[1][..])));
+
+        // A HID class driver normally selects the report protocol explicitly
+        // once it has read the report descriptor.
+        assert_eq!(handler.control_out(set_boot, &[]), Some(OutResponse::Accepted));
+        let set_report = class_request(HID_REQ_SET_PROTOCOL, 1, PRIMARY_KEYBOARD_INTERFACE as u16, 0);
+        assert_eq!(handler.control_out(set_report, &[]), Some(OutResponse::Accepted));
+        assert_eq!(handler.control_in(get, &mut buf), Some(InResponse::Accepted(&[1][..])));
+    }
+
+    #[test]
+    fn requests_for_other_interfaces_fall_through() {
+        let mut handler = UsbDeviceHandler::new(Some(PRIMARY_KEYBOARD_INTERFACE));
+        let mut buf = [0u8; 1];
+
+        assert_eq!(
+            handler.control_out(class_request(HID_REQ_SET_PROTOCOL, 0, 1, 0), &[]),
+            None
+        );
+        assert_eq!(
+            handler.control_in(class_request(HID_REQ_GET_PROTOCOL, 0, 1, 1), &mut buf),
+            None
+        );
+    }
+
+    /// A peripheral has no keyboard, and its interface 0 is the DFU one, whose
+    /// GETSTATUS shares GET_PROTOCOL's class request code.
+    #[test]
+    fn a_build_without_a_keyboard_answers_no_protocol_requests() {
+        let mut handler = UsbDeviceHandler::new(None);
+        let mut buf = [0u8; 1];
+
+        assert_eq!(
+            handler.control_out(class_request(HID_REQ_SET_PROTOCOL, 0, 0, 0), &[]),
+            None
+        );
+        assert_eq!(
+            handler.control_in(class_request(HID_REQ_GET_PROTOCOL, 0, 0, 1), &mut buf),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_protocol_requests_are_rejected() {
+        let mut handler = UsbDeviceHandler::new(Some(PRIMARY_KEYBOARD_INTERFACE));
+        let mut buf = [0u8; 1];
+        let iface = PRIMARY_KEYBOARD_INTERFACE as u16;
+
+        // wValue outside HID 1.11's 0 (Boot) / 1 (Report).
+        assert_eq!(
+            handler.control_out(class_request(HID_REQ_SET_PROTOCOL, 2, iface, 0), &[]),
+            Some(OutResponse::Rejected)
+        );
+        // SET_PROTOCOL carries no data ("wLength 0 (zero)", HID 1.11 7.2.6).
+        // Rejected rather than None: falling through would let the HID class
+        // accept it, since that path only looks at wValue.
+        assert_eq!(
+            handler.control_out(class_request(HID_REQ_SET_PROTOCOL, 1, iface, 1), &[0]),
+            Some(OutResponse::Rejected)
+        );
+        // GET_PROTOCOL is defined with wValue 0 and wLength 1.
+        assert_eq!(
+            handler.control_in(class_request(HID_REQ_GET_PROTOCOL, 1, iface, 1), &mut buf),
+            Some(InResponse::Rejected)
+        );
+        assert_eq!(
+            handler.control_in(class_request(HID_REQ_GET_PROTOCOL, 0, iface, 2), &mut buf),
+            Some(InResponse::Rejected)
+        );
+    }
 
     /// A charge-only cable / wall charger enables the device (VBUS present) but
     /// never enumerates it; the bus-idle suspend that follows must not publish
@@ -713,7 +894,7 @@ mod tests {
     /// were never configured while a BLE host could have received them.
     #[test]
     fn suspend_without_enumeration_stays_enabled() {
-        let mut handler = UsbDeviceHandler::new();
+        let mut handler = UsbDeviceHandler::new(Some(PRIMARY_KEYBOARD_INTERFACE));
         handler.enabled(true);
         assert_eq!(current_usb_state(), UsbState::Enabled);
 
@@ -734,7 +915,7 @@ mod tests {
     /// Configured.
     #[test]
     fn suspend_after_configured_publishes_suspended_and_resume_restores() {
-        let mut handler = UsbDeviceHandler::new();
+        let mut handler = UsbDeviceHandler::new(Some(PRIMARY_KEYBOARD_INTERFACE));
         handler.enabled(true);
         handler.configured(true);
 
@@ -749,7 +930,7 @@ mod tests {
     /// clobber the pre-suspend snapshot that resume restores.
     #[test]
     fn duplicate_suspend_preserves_pre_suspend_state() {
-        let mut handler = UsbDeviceHandler::new();
+        let mut handler = UsbDeviceHandler::new(Some(PRIMARY_KEYBOARD_INTERFACE));
         handler.enabled(true);
         handler.configured(true);
 
@@ -765,7 +946,7 @@ mod tests {
     /// state.
     #[test]
     fn resume_without_suspend_is_a_no_op() {
-        let mut handler = UsbDeviceHandler::new();
+        let mut handler = UsbDeviceHandler::new(Some(PRIMARY_KEYBOARD_INTERFACE));
         set_usb_state(UsbState::Configured);
 
         handler.suspended(false);

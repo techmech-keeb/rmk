@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Honour `SET_PROTOCOL` on the boot-subclass keyboard interface. v0.9.0 advertises the boot keyboard protocol in the descriptor, but the device rejected the switch to boot mode and `GET_PROTOCOL` always answered report mode, so a host that requires the switch before using the keyboard — a BIOS/UEFI setup screen, a KVM switch, a BMC — could be left without a working keyboard. The keyboard interface now accepts both modes, reports the selected one, and returns to the report protocol on a USB bus reset (HID 1.11 Appendix F.3)
+
 ## [0.9.0] - 2026-08-27
 
 ### Added
