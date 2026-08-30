@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Honour `SET_PROTOCOL` on the boot-subclass keyboard interface. The descriptor advertises the boot keyboard protocol, but the request handler still rejected the switch to boot mode and `GET_PROTOCOL` always answered report mode. The keyboard interface now accepts both modes, reports the selected one, and returns to the report protocol on a USB bus reset (HID 1.11 Appendix F.3)
+
 ### Added
 
 #### Connectivity

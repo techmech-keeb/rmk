@@ -1,11 +1,11 @@
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use embassy_futures::join::join5;
 use embassy_futures::select::{Either, select};
 use embassy_sync::signal::Signal;
 #[cfg(feature = "usb_log")]
 use embassy_usb::class::cdc_acm::CdcAcmClass;
-use embassy_usb::class::hid::{HidReader, HidWriter, ReportId, RequestHandler};
+use embassy_usb::class::hid::{HidProtocolMode, HidReader, HidSubclass, HidWriter, ReportId, RequestHandler};
 use embassy_usb::control::OutResponse;
 use embassy_usb::driver::{Driver, EndpointError};
 use embassy_usb::{Builder, Handler, UsbDevice};
@@ -501,7 +501,7 @@ macro_rules! usb_hid_state_and_config {
         }
 
         let state = paste::paste! { [<$descriptor:snake:upper _STATE>].init(::embassy_usb::class::hid::State::new()) };
-        let request_handler = paste::paste! { [<$descriptor:snake:upper _HANDLER>].init(<$handler>::default()) };
+        let request_handler = paste::paste! { [<$descriptor:snake:upper _HANDLER>].init(<$handler>::for_subclass($subclass)) };
 
         let hid_config = ::embassy_usb::class::hid::Config {
             report_descriptor: <$descriptor>::desc(),
@@ -562,8 +562,32 @@ pub(crate) use add_usb_reader_writer;
 pub(crate) use add_usb_writer;
 pub(crate) use usb_hid_state_and_config;
 
-#[derive(Default)]
-pub(crate) struct UsbRequestHandler {}
+/// Set while the host has switched the boot-subclass keyboard interface to
+/// the boot protocol with SET_PROTOCOL.
+///
+/// Lives outside `UsbRequestHandler` because a bus reset must restore the
+/// report protocol (HID 1.11 Appendix F.3) and embassy-usb notifies only the
+/// device-level `Handler` of a reset, not the per-interface `RequestHandler`s.
+/// A single flag suffices because only the keyboard interface is boot-capable.
+// TODO: Move this into `UsbRequestHandler` once embassy-usb notifies
+// `RequestHandler` of a bus reset (embassy-rs/embassy#6891).
+static BOOT_PROTOCOL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) struct UsbRequestHandler {
+    /// Whether the interface was declared with `HidSubclass::Boot`. Only such
+    /// an interface may accept SET_PROTOCOL(Boot) (HID 1.11 §7.2.6).
+    boot_capable: bool,
+}
+
+impl UsbRequestHandler {
+    pub(crate) const fn new(boot_capable: bool) -> Self {
+        Self { boot_capable }
+    }
+
+    pub(crate) const fn for_subclass(subclass: HidSubclass) -> Self {
+        Self::new(matches!(subclass, HidSubclass::Boot))
+    }
+}
 
 impl RequestHandler for UsbRequestHandler {
     fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
@@ -574,6 +598,36 @@ impl RequestHandler for UsbRequestHandler {
             return OutResponse::Rejected;
         }
         info!("Set report for {:?}: {:?}", id, data);
+        OutResponse::Accepted
+    }
+
+    fn get_protocol(&self) -> HidProtocolMode {
+        if self.boot_capable && BOOT_PROTOCOL_ACTIVE.load(Ordering::Acquire) {
+            HidProtocolMode::Boot
+        } else {
+            HidProtocolMode::Report
+        }
+    }
+
+    fn set_protocol(&mut self, protocol: HidProtocolMode) -> OutResponse {
+        if !self.boot_capable {
+            // Same as embassy-usb's default: a non-boot interface only speaks
+            // the report protocol.
+            return match protocol {
+                HidProtocolMode::Report => OutResponse::Accepted,
+                HidProtocolMode::Boot => OutResponse::Rejected,
+            };
+        }
+        // A host that only speaks the boot protocol -- a BIOS, a KVM switch, a
+        // BMC -- sends SET_PROTOCOL(Boot) before it will use the keyboard;
+        // rejecting it leaves the descriptor advertising boot support that the
+        // device then refuses to enter.
+        //
+        // Accepting it needs no change to what we transmit: KeyboardReport is
+        // already the boot keyboard layout -- one byte of modifiers, one
+        // reserved byte and six keycodes, with no report ID -- so the same
+        // report is valid in either mode.
+        BOOT_PROTOCOL_ACTIVE.store(protocol == HidProtocolMode::Boot, Ordering::Release);
         OutResponse::Accepted
     }
 }
@@ -619,6 +673,12 @@ pub(crate) fn reset_resolution_multipliers() {
 /// GET/SET_REPORT is accepted.
 #[derive(Default)]
 pub(crate) struct UsbCompositeRequestHandler {}
+
+impl UsbCompositeRequestHandler {
+    pub(crate) const fn for_subclass(_subclass: HidSubclass) -> Self {
+        Self {}
+    }
+}
 
 impl RequestHandler for UsbCompositeRequestHandler {
     fn get_report(&mut self, id: ReportId, buf: &mut [u8]) -> Option<usize> {
@@ -687,6 +747,9 @@ impl Handler for UsbDeviceHandler {
 
     fn reset(&mut self) {
         reset_resolution_multipliers();
+        // "The Boot Keyboard shall, upon reset, return to the non-boot
+        // protocol" (HID 1.11 Appendix F.3).
+        BOOT_PROTOCOL_ACTIVE.store(false, Ordering::Release);
         info!("Bus reset, the Vbus current limit is 100mA");
     }
 
@@ -751,10 +814,46 @@ impl Handler for UsbDeviceHandler {
 #[cfg(test)]
 mod tests {
     use embassy_usb::Handler;
+    use embassy_usb::class::hid::{HidProtocolMode, RequestHandler};
     use rmk_types::connection::UsbState;
 
-    use super::UsbDeviceHandler;
+    use super::{OutResponse, UsbDeviceHandler, UsbRequestHandler};
     use crate::state::{current_usb_state, set_usb_state};
+
+    /// Covers the whole protocol lifecycle in one test because the mode is a
+    /// shared static: splitting it into per-step tests would race under a
+    /// multi-threaded test runner.
+    #[test]
+    fn the_boot_interface_honours_set_protocol_and_bus_reset() {
+        let mut handler = UsbRequestHandler::new(true);
+        assert_eq!(handler.get_protocol(), HidProtocolMode::Report);
+
+        // A BIOS or KVM switch selects the boot protocol before it uses the
+        // keyboard; rejecting it here would strand a host that trusts the
+        // interface's boot subclass.
+        assert_eq!(handler.set_protocol(HidProtocolMode::Boot), OutResponse::Accepted);
+        assert_eq!(handler.get_protocol(), HidProtocolMode::Boot);
+
+        // "The Boot Keyboard shall, upon reset, return to the non-boot
+        // protocol" (HID 1.11 Appendix F.3).
+        let mut device = UsbDeviceHandler::new();
+        device.reset();
+        assert_eq!(handler.get_protocol(), HidProtocolMode::Report);
+
+        // A HID class driver normally selects the report protocol explicitly
+        // after reading the report descriptor.
+        assert_eq!(handler.set_protocol(HidProtocolMode::Boot), OutResponse::Accepted);
+        assert_eq!(handler.set_protocol(HidProtocolMode::Report), OutResponse::Accepted);
+        assert_eq!(handler.get_protocol(), HidProtocolMode::Report);
+    }
+
+    #[test]
+    fn a_non_boot_interface_keeps_the_report_only_default() {
+        let mut handler = UsbRequestHandler::new(false);
+        assert_eq!(handler.set_protocol(HidProtocolMode::Boot), OutResponse::Rejected);
+        assert_eq!(handler.set_protocol(HidProtocolMode::Report), OutResponse::Accepted);
+        assert_eq!(handler.get_protocol(), HidProtocolMode::Report);
+    }
 
     /// A charge-only cable / wall charger enables the device (VBUS present) but
     /// never enumerates it; the bus-idle suspend that follows must not publish
@@ -938,7 +1037,7 @@ mod resolution_multiplier_tests {
     /// is that only the composite interface owns the multiplier report.
     #[test]
     fn keyboard_interface_rejects_feature_reports() {
-        let mut handler = UsbRequestHandler::default();
+        let mut handler = UsbRequestHandler::new(true);
         assert_eq!(
             handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
             OutResponse::Rejected
