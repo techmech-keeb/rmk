@@ -34,7 +34,9 @@ futures = { version = "0.3", default-features = false, features = [
 ] }
 
 heapless = "0.9"
-usbd-hid = "0.10"
+# 0.10.2 is the first release with the logical_max / physical_min/max group
+# attributes the Resolution Multiplier feature descriptor needs (usbd-hid#93).
+usbd-hid = "0.10.2"
 static_cell = "2"
 sequential-storage = { version = "8.0.1", features = ["postcard"] }
 
@@ -331,10 +333,3 @@ _ble = ["dep:trouble-host", "dep:bt-hci", "storage", "rmk-types/_ble"]
 [lib]
 # Don't run doctest for lib
 doctest = false
-
-# VENDOR PATCH (olsk60, hi-res scroll): usbd-hid with logical_max / physical_min/max
-# group attributes (our upstream PR twitchyliquid64/usbd-hid#93, merged b971d4c but
-# not yet released on crates.io). Required to declare the Resolution Multiplier
-# feature's physical range in the descriptor. Drop when usbd-hid > 0.10.1 ships.
-[patch.crates-io]
-usbd-hid = { git = "https://github.com/twitchyliquid64/usbd-hid", rev = "b971d4c3b1c88ba9b58e7625f454e549e60774c9" }

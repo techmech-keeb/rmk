@@ -94,9 +94,3 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 log = "0.4"
 bluest = "0.6"
 futures-util = "0.3"
-
-# VENDOR PATCH (olsk60, hi-res scroll): same usbd-hid pin as rmk/Cargo.toml —
-# [patch] only applies at the root manifest, and this crate builds rmk as a
-# dependency. Drop when usbd-hid > 0.10.1 ships.
-[patch.crates-io]
-usbd-hid = { git = "https://github.com/twitchyliquid64/usbd-hid", rev = "b971d4c3b1c88ba9b58e7625f454e549e60774c9" }
