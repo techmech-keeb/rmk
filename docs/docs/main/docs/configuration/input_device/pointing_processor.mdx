@@ -42,6 +42,19 @@ Uses the `MotionAccumulator`: `total = remainder + delta * multiplier`, then `ou
 | 2      | 5     | 5+5=10 | 1                | 10−1×8=2  |
 | 3      | 5     | 2+5=7  | 0                | 7         |
 
+#### High-resolution scrolling
+
+With the `hires_scroll` cargo feature, the USB descriptor declares a [HID Resolution Multiplier](https://usb.org/document-library/hid-usage-tables-16) for the wheel and pan axes. A host that supports high-resolution scrolling (verified on Windows and on Linux with libinput; macOS untested) writes the feature report to ask for 120 units per detent — the granularity those hosts count in — and every producer of scroll motion then emits that many units instead of one:
+
+| | without negotiation | after the host asks for hi-res |
+| --- | --- | --- |
+| one sensor count, `divisor: 8` | 0 (kept as remainder) | 15 units = 1/8 detent |
+| a wheel key press | 1 detent | 120 units = 1 detent |
+
+The scrolling speed is unchanged either way; only the step size is. A host that never writes the feature report sees exactly today's behaviour, and so does a build without the feature, whose descriptor stays byte-for-byte identical.
+
+The multiplier is negotiated per USB connection: a bus reset or a deconfiguration drops it, and reports leaving over BLE stay in detents, because HID over GATT has no feature report characteristic to negotiate through. The feature cannot be combined with `dongle` for the same reason — the dongle forwards what its peripheral sent in detents.
+
 ### Sniper
 
 Maps X/Y to cursor at reduced sensitivity for precision aiming.

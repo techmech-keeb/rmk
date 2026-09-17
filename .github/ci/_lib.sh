@@ -48,6 +48,8 @@ RMK_FEATURESETS=(
     "passkey_entry"
     "split,vial,storage,passkey_entry"
     "vial,storage,steno"
+    "vial,storage,hires_scroll"
+    "vial,storage,async_matrix,_ble,hires_scroll"
     "split,vial,storage,async_matrix,_ble,steno"
     "split,vial,storage,async_matrix,_ble,subrating"
     "rynk,_ble,split,storage,async_matrix"
@@ -67,6 +69,7 @@ RMK_TEST_FEATURESETS=(
     "split,dfu_nrf,dfu_split,storage,async_matrix,embassy-nrf/nrf52840"
     "vial,host_lock,_no_usb,steno,passkey_entry"
     "rynk,_ble,split,async_matrix,storage"
+    "vial,storage,async_matrix,_ble,hires_scroll"
     "dongle,_ble,storage"
     "dongle,vial,_ble,storage"
 )

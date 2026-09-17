@@ -206,8 +206,22 @@ impl AsInputReport for MouseReport {
     }
 }
 
+/// The report id of the Resolution Multiplier feature report on the composite
+/// interface. Distinct from every [`CompositeReportType`] input id: hosts
+/// negotiate hi-res scrolling by writing this report, never by sending input.
+#[cfg(feature = "hires_scroll")]
+pub(crate) const RESOLUTION_MULTIPLIER_REPORT_ID: u8 = 0x05;
+
+/// Wheel and pan units per detent once the host selects hi-res scrolling.
+/// 120 is the granularity Windows (`WHEEL_DELTA`) and libinput (v120) count
+/// in, so neither side has to round. This MUST equal the `physical_max` the
+/// descriptor declares; the descriptor byte test pins them together.
+#[cfg(feature = "hires_scroll")]
+pub(crate) const RESOLUTION_MULTIPLIER_MAX: u8 = 120;
+
 /// A composite hid report which contains mouse, consumer, system reports.
 /// Report id is used to distinguish from them.
+#[cfg(not(feature = "hires_scroll"))]
 #[gen_hid_descriptor(
     (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = MOUSE) = {
         (collection = PHYSICAL, usage = POINTER) = {
@@ -258,6 +272,82 @@ pub struct CompositeReport {
     pub(crate) pan: i16,   // Scroll left (negative) or right (positive) this many units
     pub(crate) media_usage_id: u16,
     pub(crate) system_usage_id: u8,
+}
+
+/// The hi-res variant of [`CompositeReport`]: Wheel and AC Pan each sit in a
+/// logical collection together with a Resolution Multiplier feature (usage
+/// 0x48, logical 0..=1, physical 1..=[`RESOLUTION_MULTIPLIER_MAX`]). The
+/// multiplier applies to the controls sharing its logical collection, so a
+/// bare feature in the physical collection would read as applying to X/Y too.
+/// Each feature field has report count 1 (Linux ignores multiplier fields
+/// with any other count) and its own report id, and the host reads and writes
+/// them through `usb::UsbCompositeRequestHandler`.
+#[cfg(feature = "hires_scroll")]
+#[gen_hid_descriptor(
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = MOUSE) = {
+        (collection = PHYSICAL, usage = POINTER) = {
+            (report_id = 0x02,) = {
+                (usage_page = BUTTON, usage_min = BUTTON_1, usage_max = BUTTON_8) = {
+                    #[packed_bits = 8] #[item_settings(data,variable,absolute)] buttons=input;
+                };
+                (usage_page = GENERIC_DESKTOP,) = {
+                    (usage = X,) = {
+                        #[item_settings(data,variable,relative)] x=input;
+                    };
+                    (usage = Y,) = {
+                        #[item_settings(data,variable,relative)] y=input;
+                    };
+                };
+            };
+            (collection = LOGICAL, usage_page = GENERIC_DESKTOP, usage = WHEEL) = {
+                (report_id = 0x05, usage = 0x48, logical_min = 0, logical_max = 1,
+                 physical_min = 1, physical_max = 120) = {
+                    #[item_settings(data,variable,absolute)] wheel_multiplier=feature;
+                };
+                (report_id = 0x02, usage = WHEEL,) = {
+                    #[item_settings(data,variable,relative)] wheel=input;
+                };
+            };
+            (collection = LOGICAL, usage_page = CONSUMER, usage = AC_PAN) = {
+                (report_id = 0x05, usage_page = GENERIC_DESKTOP, usage = 0x48, logical_min = 0,
+                 logical_max = 1, physical_min = 1, physical_max = 120) = {
+                    #[item_settings(data,variable,absolute)] pan_multiplier=feature;
+                };
+                (report_id = 0x02, usage_page = CONSUMER, usage = AC_PAN,) = {
+                    #[item_settings(data,variable,relative)] pan=input;
+                };
+            };
+        };
+    },
+    (collection = APPLICATION, usage_page = CONSUMER, usage = CONSUMER_CONTROL) = {
+        (report_id = 0x03,) = {
+            (usage_page = CONSUMER, usage_min = 0x00, usage_max = 0x514) = {
+            #[item_settings(data,array,absolute,not_null)] media_usage_id=input;
+            }
+        };
+    },
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = SYSTEM_CONTROL) = {
+        (report_id = 0x04,) = {
+            (usage_min = 0x01, usage_max = 0xB7, logical_min = 1) = {
+                #[item_settings(data,array,absolute,not_null)] system_usage_id=input;
+            };
+        };
+    }
+)]
+#[derive(Default, Serialize)]
+pub struct CompositeReport {
+    pub(crate) buttons: u8, // MouseButtons
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+    pub(crate) wheel: i16, // Scroll down (negative) or up (positive) this many units
+    pub(crate) pan: i16,   // Scroll left (negative) or right (positive) this many units
+    pub(crate) media_usage_id: u16,
+    pub(crate) system_usage_id: u8,
+    /// Feature fields: only `desc()` reads them. Input payloads keep being
+    /// serialized from [`MouseReport`] and friends, and the multipliers travel
+    /// over control transfers, not over this struct.
+    pub(crate) wheel_multiplier: u8,
+    pub(crate) pan_multiplier: u8,
 }
 
 #[cfg(test)]
@@ -486,6 +576,122 @@ pub(crate) async fn run_led_reader<R: HidReaderTrait<ReportType = LedIndicator>>
                 debug!("Read HID LED indicator error: {:?}", e);
                 embassy_time::Timer::after_millis(1000).await;
             }
+        }
+    }
+}
+
+#[cfg(all(test, not(feature = "hires_scroll")))]
+mod composite_descriptor_tests {
+    use usbd_hid::descriptor::SerializedDescriptor;
+
+    use super::CompositeReport;
+
+    /// Pins the default descriptor byte-for-byte, so the `hires_scroll`
+    /// feature cannot change what a build without it sends to the host.
+    /// Hosts cache descriptors per VID/PID, so an accidental change here is
+    /// not something a user can clear by replugging.
+    #[test]
+    fn composite_descriptor_bytes_are_pinned() {
+        let expected: [u8; 110] = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x85, 0x02, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08,
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x17, 0x01, 0x80, 0xff,
+            0xff, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x01, 0x81, 0x06, 0x09, 0x31, 0x81, 0x06, 0x09, 0x38, 0x81, 0x06,
+            0x05, 0x0c, 0x0a, 0x38, 0x02, 0x81, 0x06, 0xc0, 0xc0, 0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x03, 0x05,
+            0x0c, 0x19, 0x00, 0x2a, 0x14, 0x05, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00, 0x81, 0x00, 0xc0, 0x05, 0x01,
+            0x09, 0x80, 0xa1, 0x01, 0x85, 0x04, 0x19, 0x01, 0x29, 0xb7, 0x15, 0x01, 0x26, 0xff, 0x00, 0x75, 0x08, 0x81,
+            0x00, 0xc0,
+        ];
+        assert_eq!(CompositeReport::desc(), expected);
+    }
+}
+
+#[cfg(all(test, feature = "hires_scroll"))]
+mod resolution_multiplier_descriptor_tests {
+    use usbd_hid::descriptor::SerializedDescriptor;
+
+    use super::{CompositeReport, RESOLUTION_MULTIPLIER_MAX, RESOLUTION_MULTIPLIER_REPORT_ID};
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    /// The structure a host looks for. The physical range is spelled from
+    /// `RESOLUTION_MULTIPLIER_MAX`, so the descriptor and the value the
+    /// producers scale by cannot drift apart without failing here.
+    #[test]
+    fn composite_descriptor_declares_two_resolution_multipliers() {
+        let desc = CompositeReport::desc();
+
+        assert_eq!(count(desc, &[0xa1, 0x02]), 2, "one logical collection per axis");
+        assert_eq!(count(desc, &[0x09, 0x48]), 2, "Resolution Multiplier usages");
+        assert_eq!(count(desc, &[0xb1, 0x02]), 2, "feature items");
+        assert_eq!(
+            count(desc, &[0x85, RESOLUTION_MULTIPLIER_REPORT_ID]),
+            2,
+            "both features share the dedicated report id"
+        );
+        assert_eq!(
+            count(desc, &[0x35, 0x01, 0x45, RESOLUTION_MULTIPLIER_MAX]),
+            2,
+            "physical range must equal RESOLUTION_MULTIPLIER_MAX"
+        );
+        // Physical range is a global item: leaving it set would apply it to
+        // the inputs that follow.
+        assert_eq!(count(desc, &[0x35, 0x00, 0x45, 0x00]), 2, "physical range reset");
+
+        // The mouse input report keeps its own id, and the media/system
+        // reports are untouched.
+        assert!(count(desc, &[0x85, 0x02]) >= 2, "mouse report id re-emitted per input");
+        assert_eq!(count(desc, &[0x85, 0x03]), 1);
+        assert_eq!(count(desc, &[0x85, 0x04]), 1);
+    }
+
+    /// Pins the descriptor byte-for-byte: counting items cannot prove one sits
+    /// in the right collection or report, so any change in the macro input or
+    /// in `usbd-hid` shows up here as a diff to review.
+    #[test]
+    fn composite_descriptor_bytes_are_pinned() {
+        let expected: [u8; 191] = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x85, 0x02, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08,
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x17, 0x01, 0x80, 0xff,
+            0xff, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x01, 0x81, 0x06, 0x09, 0x31, 0x81, 0x06, 0x05, 0x01, 0x09, 0x38,
+            0xa1, 0x02, 0x09, 0x48, 0x85, 0x05, 0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x78, 0x75, 0x08, 0xb1, 0x02,
+            0x35, 0x00, 0x45, 0x00, 0x09, 0x38, 0x85, 0x02, 0x17, 0x01, 0x80, 0xff, 0xff, 0x26, 0xff, 0x7f, 0x75, 0x10,
+            0x81, 0x06, 0xc0, 0x05, 0x0c, 0x0a, 0x38, 0x02, 0xa1, 0x02, 0x05, 0x01, 0x09, 0x48, 0x85, 0x05, 0x15, 0x00,
+            0x25, 0x01, 0x35, 0x01, 0x45, 0x78, 0x75, 0x08, 0xb1, 0x02, 0x35, 0x00, 0x45, 0x00, 0x05, 0x0c, 0x0a, 0x38,
+            0x02, 0x85, 0x02, 0x17, 0x01, 0x80, 0xff, 0xff, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x81, 0x06, 0xc0, 0xc0, 0xc0,
+            0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x03, 0x05, 0x0c, 0x19, 0x00, 0x2a, 0x14, 0x05, 0x15, 0x00, 0x27,
+            0xff, 0xff, 0x00, 0x00, 0x81, 0x00, 0xc0, 0x05, 0x01, 0x09, 0x80, 0xa1, 0x01, 0x85, 0x04, 0x19, 0x01, 0x29,
+            0xb7, 0x15, 0x01, 0x26, 0xff, 0x00, 0x75, 0x08, 0x81, 0x00, 0xc0,
+        ];
+        assert_eq!(CompositeReport::desc(), expected);
+    }
+
+    /// Declaration order is not a spec requirement — a host associates the
+    /// multiplier with the controls in its logical collection — but feature
+    /// before input is the layout every host is tested against, so keep it.
+    #[test]
+    fn multiplier_feature_precedes_its_input() {
+        let desc = CompositeReport::desc();
+        let mut from = 0;
+        for _ in 0..2 {
+            let collection = desc[from..]
+                .windows(2)
+                .position(|w| w == [0xa1, 0x02])
+                .expect("collection")
+                + from;
+            let feature = desc[collection..]
+                .windows(2)
+                .position(|w| w == [0xb1, 0x02])
+                .expect("feature")
+                + collection;
+            let input = desc[collection..]
+                .windows(2)
+                .position(|w| w == [0x81, 0x06])
+                .expect("relative input")
+                + collection;
+            assert!(feature < input, "feature before input inside the collection");
+            from = collection + 2;
         }
     }
 }
