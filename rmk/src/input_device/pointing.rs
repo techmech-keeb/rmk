@@ -445,55 +445,52 @@ impl MotionAccumulator {
 
     /// Accumulate motion and return the divided output, keeping remainder.
     /// A divisor of 0 disables that axis (always outputs 0).
-    pub fn accumulate(&mut self, dx: i16, dy: i16, ratio_x: (u8, u8), ratio_y: (u8, u8)) -> (i16, i16) {
-        let out_x = if ratio_x.1 == 0 {
-            self.remainder_x = 0;
-            0
-        } else {
-            let total_x = self.remainder_x.saturating_add(dx * ratio_x.0 as i16);
-            let out = total_x / ratio_x.1 as i16;
-            self.remainder_x = total_x - out * ratio_x.1 as i16;
-            out
-        };
-
-        let out_y = if ratio_y.1 == 0 {
-            self.remainder_y = 0;
-            0
-        } else {
-            let total_y = self.remainder_y.saturating_add(dy * ratio_y.0 as i16);
-            let out = total_y / ratio_y.1 as i16;
-            self.remainder_y = total_y - out * ratio_y.1 as i16;
-            out
-        };
-
-        (out_x, out_y)
+    ///
+    /// The ratio is `(multiplier, divisor)`. It is 16-bit because hi-res
+    /// scrolling multiplies the configured ratio by the resolution the host
+    /// negotiated, which is far more than a `u8` holds.
+    pub fn accumulate(&mut self, dx: i16, dy: i16, ratio_x: (u16, u16), ratio_y: (u16, u16)) -> (i16, i16) {
+        (
+            Self::accumulate_axis(&mut self.remainder_x, dx, ratio_x, Remainder::Subtract),
+            Self::accumulate_axis(&mut self.remainder_y, dy, ratio_y, Remainder::Subtract),
+        )
     }
 
     /// Accumulate motion and return the divided output, keeping remainder.
     /// Do not subtract output from remainder.
-    pub fn accumulate_persistent(&mut self, dx: i16, dy: i16, ratio_x: (u8, u8), ratio_y: (u8, u8)) -> (i16, i16) {
-        let out_x = if ratio_x.1 == 0 {
-            self.remainder_x = 0;
-            0
-        } else {
-            let total_x = self.remainder_x.saturating_add(dx * ratio_x.0 as i16);
-            let out = total_x / ratio_x.1 as i16;
-            self.remainder_x = total_x;
-            out
-        };
-
-        let out_y = if ratio_y.1 == 0 {
-            self.remainder_y = 0;
-            0
-        } else {
-            let total_y = self.remainder_y.saturating_add(dy * ratio_y.0 as i16);
-            let out = total_y / ratio_y.1 as i16;
-            self.remainder_y = total_y;
-            out
-        };
-
-        (out_x, out_y)
+    pub fn accumulate_persistent(&mut self, dx: i16, dy: i16, ratio_x: (u16, u16), ratio_y: (u16, u16)) -> (i16, i16) {
+        (
+            Self::accumulate_axis(&mut self.remainder_x, dx, ratio_x, Remainder::Keep),
+            Self::accumulate_axis(&mut self.remainder_y, dy, ratio_y, Remainder::Keep),
+        )
     }
+
+    /// One axis of the two methods above. The running total is 32-bit so a
+    /// large delta times a hi-res multiplier cannot overflow on the way in;
+    /// what is stored and returned is saturated back to the report's width.
+    fn accumulate_axis(remainder: &mut i16, delta: i16, (mul, div): (u16, u16), keep: Remainder) -> i16 {
+        if div == 0 {
+            *remainder = 0;
+            return 0;
+        }
+        let total = *remainder as i32 + delta as i32 * mul as i32;
+        let out = total / div as i32;
+        let left = match keep {
+            Remainder::Subtract => total - out * div as i32,
+            Remainder::Keep => total,
+        };
+        *remainder = left.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        out.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    }
+}
+
+/// What [`MotionAccumulator::accumulate_axis`] leaves behind for the next call.
+#[derive(Clone, Copy)]
+enum Remainder {
+    /// Keep only what did not make a whole output unit.
+    Subtract,
+    /// Keep the whole running total.
+    Keep,
 }
 
 #[derive(Clone)]
@@ -608,8 +605,8 @@ impl<'a> PointingProcessor<'a> {
                         let (sx, sy) = self.accumulator.accumulate(
                             x,
                             y,
-                            (scroll_config.multiplier_x, scroll_config.divisor_x),
-                            (scroll_config.multiplier_y, scroll_config.divisor_y),
+                            (scroll_config.multiplier_x as u16, scroll_config.divisor_x as u16),
+                            (scroll_config.multiplier_y as u16, scroll_config.divisor_y as u16),
                         );
                         if sx == 0 && sy == 0 {
                             return;
@@ -631,8 +628,8 @@ impl<'a> PointingProcessor<'a> {
                         let (sx, sy) = self.accumulator.accumulate(
                             x,
                             y,
-                            (sniper_config.multiplier, sniper_config.divisor),
-                            (sniper_config.multiplier, sniper_config.divisor),
+                            (sniper_config.multiplier as u16, sniper_config.divisor as u16),
+                            (sniper_config.multiplier as u16, sniper_config.divisor as u16),
                         );
                         if sx == 0 && sy == 0 {
                             return;
@@ -713,7 +710,7 @@ fn compute_caret_taps(
 ) -> Option<(HidKeyCode, u8)> {
     let divisor_x = if cfg.disable_x { 0 } else { 1 };
     let divisor_y = if cfg.disable_y { 0 } else { 1 };
-    let (mut dx, mut dy) = accumulator.accumulate_persistent(x, y, (1, divisor_x), (1, divisor_y));
+    let (mut dx, mut dy) = accumulator.accumulate_persistent(x, y, (1, divisor_x as u16), (1, divisor_y as u16));
 
     if (dx.abs() + dy.abs()) <= cfg.threshold {
         return None;
@@ -757,7 +754,7 @@ fn compute_caret_taps(
                 (0, r)
             }
         };
-        (dx, dy) = accumulator.accumulate_persistent(reduce_x, reduce_y, (1, divisor_x), (1, divisor_y));
+        (dx, dy) = accumulator.accumulate_persistent(reduce_x, reduce_y, (1, divisor_x as u16), (1, divisor_y as u16));
         count = count.saturating_add(1);
         if count == u8::MAX {
             break; // safety break to prevent infinite loop
@@ -1535,8 +1532,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             3,
             3,
-            (config.multiplier_x, config.divisor_x),
-            (config.multiplier_y, config.divisor_y),
+            (config.multiplier_x as u16, config.divisor_x as u16),
+            (config.multiplier_y as u16, config.divisor_y as u16),
         );
         assert_eq!(sx, 0);
         assert_eq!(sy, 0);
@@ -1549,8 +1546,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             6,
             6,
-            (config.multiplier_x, config.divisor_x),
-            (config.multiplier_y, config.divisor_y),
+            (config.multiplier_x as u16, config.divisor_x as u16),
+            (config.multiplier_y as u16, config.divisor_y as u16),
         );
         assert_eq!(sx, 1); // (3+6)/8 = 1 remainder 1
         assert_eq!(sy, 1);
@@ -1572,8 +1569,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             10,
             -10,
-            (config.multiplier, config.divisor),
-            (config.multiplier, config.divisor),
+            (config.multiplier as u16, config.divisor as u16),
+            (config.multiplier as u16, config.divisor as u16),
         );
         assert_eq!(sx, 2); // 10/4 = 2 remainder 2
         assert_eq!(sy, -2); // -10/4 = -2 remainder -2
@@ -1626,8 +1623,8 @@ mod tests {
         let mut acc_inverted = MotionAccumulator::default();
 
         let divisor = 1u8;
-        let (_, sy_default) = acc_default.accumulate(0, 10, (1, divisor), (1, divisor));
-        let (_, sy_inverted) = acc_inverted.accumulate(0, 10, (1, divisor), (1, divisor));
+        let (_, sy_default) = acc_default.accumulate(0, 10, (1, divisor as u16), (1, divisor as u16));
+        let (_, sy_inverted) = acc_inverted.accumulate(0, 10, (1, divisor as u16), (1, divisor as u16));
 
         // Default: wheel = -sy = -10
         let wheel_default = -sy_default;
@@ -1651,8 +1648,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             5,
             -3,
-            (config.multiplier, config.divisor),
-            (config.multiplier, config.divisor),
+            (config.multiplier as u16, config.divisor as u16),
+            (config.multiplier as u16, config.divisor as u16),
         );
         let out_x = if config.invert_x { -sx } else { sx };
         let out_y = if config.invert_y { -sy } else { sy };
@@ -1677,8 +1674,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             16,
             16,
-            (config.multiplier_x, config.divisor_x),
-            (config.multiplier_x, config.divisor_y),
+            (config.multiplier_x as u16, config.divisor_x as u16),
+            (config.multiplier_x as u16, config.divisor_y as u16),
         );
         assert_eq!(sx, 4); // 16/4 = 4
         assert_eq!(sy, 2); // 16/8 = 2
@@ -1698,8 +1695,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             10,
             10,
-            (config.multiplier_x, config.divisor_x),
-            (config.multiplier_y, config.divisor_y),
+            (config.multiplier_x as u16, config.divisor_x as u16),
+            (config.multiplier_y as u16, config.divisor_y as u16),
         );
         assert_eq!(sx, 3); // (0+10*3)/8 = 3 r6
         assert_eq!(sy, 3);
@@ -1721,8 +1718,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             10,
             -10,
-            (config.multiplier_x, config.divisor_x),
-            (config.multiplier_y, config.divisor_y),
+            (config.multiplier_x as u16, config.divisor_x as u16),
+            (config.multiplier_y as u16, config.divisor_y as u16),
         );
         assert_eq!(sx, 2); // (0+10*2)/8 = 2 r4
         assert_eq!(sy, -3); // (0+(-10)*3)/8 = -3 r-6
@@ -1745,8 +1742,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             2,
             2,
-            (config.multiplier_x, config.divisor_x),
-            (config.multiplier_y, config.divisor_y),
+            (config.multiplier_x as u16, config.divisor_x as u16),
+            (config.multiplier_y as u16, config.divisor_y as u16),
         );
         assert_eq!(sx, 0); // (0+2*3)/8 = 0 r6
         assert_eq!(sy, 0);
@@ -1757,8 +1754,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             2,
             2,
-            (config.multiplier_x, config.divisor_x),
-            (config.multiplier_y, config.divisor_y),
+            (config.multiplier_x as u16, config.divisor_x as u16),
+            (config.multiplier_y as u16, config.divisor_y as u16),
         );
         assert_eq!(sx, 1); // (6+2*3)/8 = 12/8 = 1 r4
         assert_eq!(sy, 1);
@@ -1778,8 +1775,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             5,
             0,
-            (config.multiplier, config.divisor),
-            (config.multiplier, config.divisor),
+            (config.multiplier as u16, config.divisor as u16),
+            (config.multiplier as u16, config.divisor as u16),
         );
         assert_eq!(sx, 3); // (0+5*3)/4 = 3 r3
         assert_eq!(sy, 0);
@@ -1799,8 +1796,8 @@ mod tests {
         let (sx, sy) = acc.accumulate(
             -3,
             0,
-            (config.multiplier, config.divisor),
-            (config.multiplier, config.divisor),
+            (config.multiplier as u16, config.divisor as u16),
+            (config.multiplier as u16, config.divisor as u16),
         );
         assert_eq!(sx, -2); // (0+(-3)*3)/4 = -9/4 = -2 r-1
         assert_eq!(sy, 0);
