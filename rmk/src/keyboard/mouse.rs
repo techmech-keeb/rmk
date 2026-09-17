@@ -230,8 +230,12 @@ impl MouseState {
         if self.wheel.has_active_direction() {
             let unit = self.calculate_wheel_unit(config);
             let (pan, wheel) = self.wheel.axis_values(unit);
-            self.report.wheel = wheel;
-            self.report.pan = pan;
+            // A wheel key always means whole detents: emit as many units as
+            // the host negotiated for one, so hi-res does not shrink the step
+            // a key press produces. Both multipliers are 1 until it does.
+            let (wheel_res, pan_res) = crate::hires::resolution_multipliers();
+            self.report.wheel = wheel.saturating_mul(wheel_res);
+            self.report.pan = pan.saturating_mul(pan_res);
         } else {
             self.report.wheel = 0;
             self.report.pan = 0;
@@ -817,6 +821,33 @@ mod test {
         state.process(HidKeyCode::MouseAccel0, true, &config);
         let action = state.process(HidKeyCode::MouseAccel0, false, &config);
         assert_eq!(action, MouseAction::None);
+    }
+
+    /// A wheel key means a whole detent, so at hi-res it has to send as many
+    /// units as the host asked one detent to be worth. Missing this scaling on
+    /// any one producer is what makes a keyboard scroll a fraction of a notch.
+    #[cfg(feature = "hires_scroll")]
+    #[test]
+    fn a_wheel_key_sends_a_whole_detent_at_hi_res() {
+        use rmk_types::connection::UsbState;
+
+        let mut state = MouseState::new();
+        let config = default_config();
+        crate::state::set_usb_state(UsbState::Configured);
+        crate::hires::reset_multipliers();
+
+        state.process(HidKeyCode::MouseWheelUp, true, &config);
+        let detents = state.report.wheel;
+        assert_ne!(detents, 0, "a wheel key scrolls");
+
+        crate::hires::set_raw_multipliers(1, 1);
+        state.recalculate_report(&config);
+        assert_eq!(
+            state.report.wheel,
+            detents * crate::hid::RESOLUTION_MULTIPLIER_MAX as i16
+        );
+
+        crate::hires::reset_multipliers();
     }
 
     // -- I. on_repeat_tick ----------------------------------------------------

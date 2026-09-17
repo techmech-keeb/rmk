@@ -359,6 +359,17 @@ impl<D: Driver<'static>> UsbTransportBuilder<D> {
             ::embassy_usb::class::hid::HidSubclass::Boot,
             ::embassy_usb::class::hid::HidBootProtocol::Keyboard
         );
+        // The composite interface is the one that declares the Resolution
+        // Multiplier feature report, so it gets the handler that answers it.
+        #[cfg(feature = "hires_scroll")]
+        let other_writer = add_usb_writer!(
+            &mut builder,
+            CompositeReport,
+            COMPOSITE_WRITE_SIZE,
+            16,
+            crate::usb::UsbCompositeRequestHandler
+        );
+        #[cfg(not(feature = "hires_scroll"))]
         let other_writer = add_usb_writer!(&mut builder, CompositeReport, COMPOSITE_WRITE_SIZE, 16);
         #[cfg(feature = "steno")]
         let steno_writer = add_usb_writer!(&mut builder, StenoReport, 9, 16);
@@ -576,19 +587,24 @@ macro_rules! add_usb_logger {
 /// from the descriptor name so each interface keeps its own State/Handler.
 /// Size `$max_packet` to the actual report to conserve Packet Memory Area on tight parts.
 macro_rules! usb_hid_state_and_config {
-    ($descriptor:ty, $max_packet:expr, $subclass:expr, $protocol:expr) => {{
+    ($descriptor:ty, $max_packet:expr, $subclass:expr, $protocol:expr) => {
+        $crate::usb::usb_hid_state_and_config!(
+            $descriptor,
+            $max_packet,
+            $subclass,
+            $protocol,
+            $crate::usb::UsbRequestHandler
+        )
+    };
+    ($descriptor:ty, $max_packet:expr, $subclass:expr, $protocol:expr, $handler:ty) => {{
         use usbd_hid::descriptor::SerializedDescriptor;
         paste::paste! {
             static [<$descriptor:snake:upper _STATE>]: ::static_cell::StaticCell<::embassy_usb::class::hid::State> = ::static_cell::StaticCell::new();
-            static [<$descriptor:snake:upper _HANDLER>]: ::static_cell::StaticCell<$crate::usb::UsbRequestHandler> = ::static_cell::StaticCell::new();
+            static [<$descriptor:snake:upper _HANDLER>]: ::static_cell::StaticCell<$handler> = ::static_cell::StaticCell::new();
         }
 
         let state = paste::paste! { [<$descriptor:snake:upper _STATE>].init(::embassy_usb::class::hid::State::new()) };
-        let request_handler = paste::paste! {
-            [<$descriptor:snake:upper _HANDLER>].init($crate::usb::UsbRequestHandler {
-                protocol: ::embassy_usb::class::hid::HidProtocolMode::Report,
-            })
-        };
+        let request_handler = paste::paste! { [<$descriptor:snake:upper _HANDLER>].init(<$handler>::default()) };
 
         let hid_config = ::embassy_usb::class::hid::Config {
             report_descriptor: <$descriptor>::desc(),
@@ -603,12 +619,22 @@ macro_rules! usb_hid_state_and_config {
 }
 
 macro_rules! add_usb_writer {
-    ($usb_builder:expr, $descriptor:ty, $n:expr, $max_packet:expr) => {{
+    ($usb_builder:expr, $descriptor:ty, $n:expr, $max_packet:expr) => {
+        $crate::usb::add_usb_writer!(
+            $usb_builder,
+            $descriptor,
+            $n,
+            $max_packet,
+            $crate::usb::UsbRequestHandler
+        )
+    };
+    ($usb_builder:expr, $descriptor:ty, $n:expr, $max_packet:expr, $handler:ty) => {{
         let (state, hid_config) = $crate::usb::usb_hid_state_and_config!(
             $descriptor,
             $max_packet,
             ::embassy_usb::class::hid::HidSubclass::No,
-            ::embassy_usb::class::hid::HidBootProtocol::None
+            ::embassy_usb::class::hid::HidBootProtocol::None,
+            $handler
         );
         ::embassy_usb::class::hid::HidWriter::<_, $n>::new($usb_builder, state, hid_config)
     }};
@@ -643,8 +669,23 @@ pub(crate) struct UsbRequestHandler {
     pub(crate) protocol: HidProtocolMode,
 }
 
+impl Default for UsbRequestHandler {
+    fn default() -> Self {
+        Self {
+            protocol: HidProtocolMode::Report,
+        }
+    }
+}
+
 impl RequestHandler for UsbRequestHandler {
     fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
+        // Only the composite interface declares a feature report; rejecting it
+        // everywhere else keeps a multiplier written to the wrong interface
+        // from looking accepted.
+        #[cfg(feature = "hires_scroll")]
+        if let ReportId::Feature(_) = id {
+            return OutResponse::Rejected;
+        }
         info!("Set report for {:?}: {:?}", id, data);
         OutResponse::Accepted
     }
@@ -659,6 +700,49 @@ impl RequestHandler for UsbRequestHandler {
         // TODO: Return to Report on a bus reset once embassy-usb tells the
         // request handler about it (embassy-rs/embassy#6891).
         self.protocol = protocol;
+        OutResponse::Accepted
+    }
+}
+
+/// Answers `GET_FEATURE` / `SET_FEATURE` for the Resolution Multiplier report
+/// on the composite interface — the one place a host can negotiate hi-res
+/// scrolling. The value itself lives in [`crate::hires`], because the
+/// producers that scale by it run in other tasks.
+#[cfg(feature = "hires_scroll")]
+#[derive(Default)]
+pub(crate) struct UsbCompositeRequestHandler {}
+
+#[cfg(feature = "hires_scroll")]
+impl RequestHandler for UsbCompositeRequestHandler {
+    fn get_report(&mut self, id: ReportId, buf: &mut [u8]) -> Option<usize> {
+        // A numbered report carries its id as a one-byte prefix on control
+        // transfers too (HID 1.11 §8.1); Linux issues this GET before every
+        // SET, to preserve the field it isn't changing.
+        if id != ReportId::Feature(crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID) || buf.len() < 3 {
+            return None;
+        }
+        let (wheel, pan) = crate::hires::raw_multipliers();
+        buf[0] = crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID;
+        buf[1] = wheel;
+        buf[2] = pan;
+        Some(3)
+    }
+
+    fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
+        if id != ReportId::Feature(crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID) {
+            return OutResponse::Rejected;
+        }
+        // Exactly the wire format of the numbered report: [id, wheel, pan].
+        // An out-of-range value is rejected rather than clamped, so host and
+        // device cannot end up disagreeing about the rate.
+        let [report_id, wheel, pan] = *data else {
+            return OutResponse::Rejected;
+        };
+        if report_id != crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID || wheel > 1 || pan > 1 {
+            return OutResponse::Rejected;
+        }
+        crate::hires::set_raw_multipliers(wheel, pan);
+        info!("Resolution multiplier set: wheel={} pan={}", wheel, pan);
         OutResponse::Accepted
     }
 }
@@ -681,6 +765,10 @@ impl UsbDeviceHandler {
 
 impl Handler for UsbDeviceHandler {
     fn enabled(&mut self, enabled: bool) {
+        #[cfg(feature = "hires_scroll")]
+        if !enabled {
+            crate::hires::reset_multipliers();
+        }
         if enabled {
             info!("Device enabled");
             set_usb_state(UsbState::Enabled);
@@ -691,6 +779,8 @@ impl Handler for UsbDeviceHandler {
     }
 
     fn reset(&mut self) {
+        #[cfg(feature = "hires_scroll")]
+        crate::hires::reset_multipliers();
         info!("Bus reset, the Vbus current limit is 100mA");
     }
 
@@ -699,6 +789,10 @@ impl Handler for UsbDeviceHandler {
     }
 
     fn configured(&mut self, configured: bool) {
+        #[cfg(feature = "hires_scroll")]
+        if !configured {
+            crate::hires::reset_multipliers();
+        }
         if configured {
             set_usb_state(UsbState::Configured);
             info!("Device configured, it may now draw up to the configured current from Vbus.")
@@ -838,5 +932,143 @@ mod tests {
 
         handler.suspended(false);
         assert_eq!(current_usb_state(), UsbState::Configured);
+    }
+}
+
+#[cfg(all(test, feature = "hires_scroll"))]
+mod resolution_multiplier_tests {
+    use embassy_usb::Handler;
+    use embassy_usb::class::hid::{ReportId, RequestHandler};
+    use embassy_usb::control::OutResponse;
+    use rmk_types::connection::UsbState;
+
+    use super::{UsbCompositeRequestHandler, UsbDeviceHandler, UsbRequestHandler};
+    use crate::hid::{RESOLUTION_MULTIPLIER_MAX, RESOLUTION_MULTIPLIER_REPORT_ID};
+    use crate::hires::{raw_multipliers, reset_multipliers, resolution_multipliers};
+    use crate::state::set_usb_state;
+
+    const FEATURE: ReportId = ReportId::Feature(RESOLUTION_MULTIPLIER_REPORT_ID);
+
+    /// The multipliers only apply while USB is the transport carrying reports.
+    fn usb_is_the_active_transport() {
+        set_usb_state(UsbState::Configured);
+    }
+
+    fn get(handler: &mut UsbCompositeRequestHandler) -> [u8; 3] {
+        let mut buf = [0u8; 8];
+        let n = handler.get_report(FEATURE, &mut buf).expect("feature GET must answer");
+        assert_eq!(n, 3, "report id + wheel + pan");
+        [buf[0], buf[1], buf[2]]
+    }
+
+    #[test]
+    fn the_host_reads_back_what_it_wrote() {
+        usb_is_the_active_transport();
+        reset_multipliers();
+        let mut handler = UsbCompositeRequestHandler::default();
+
+        // Before the host asks: logical minimum, one unit per detent.
+        assert_eq!(get(&mut handler), [RESOLUTION_MULTIPLIER_REPORT_ID, 0, 0]);
+        assert_eq!(resolution_multipliers(), (1, 1));
+
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
+            OutResponse::Accepted
+        );
+        assert_eq!(get(&mut handler), [RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]);
+        let max = RESOLUTION_MULTIPLIER_MAX as i16;
+        assert_eq!(resolution_multipliers(), (max, max));
+
+        // The axes are independent, and the pair comes from one load, so a
+        // producer never sees half of a SET_REPORT.
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 0]),
+            OutResponse::Accepted
+        );
+        assert_eq!(resolution_multipliers(), (max, 1));
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 0, 1]),
+            OutResponse::Accepted
+        );
+        assert_eq!(resolution_multipliers(), (1, max));
+
+        reset_multipliers();
+    }
+
+    #[test]
+    fn invalid_writes_are_rejected_and_change_nothing() {
+        usb_is_the_active_transport();
+        reset_multipliers();
+        let mut handler = UsbCompositeRequestHandler::default();
+
+        for bad in [
+            &[][..],
+            &[1][..],
+            &[RESOLUTION_MULTIPLIER_REPORT_ID][..],
+            &[1, 1][..],                                     // no report id prefix
+            &[RESOLUTION_MULTIPLIER_REPORT_ID, 1][..],       // one field missing
+            &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1, 0][..], // too long
+            &[0x77, 1, 1][..],                               // wrong id prefix
+            &[RESOLUTION_MULTIPLIER_REPORT_ID, 2, 0][..],    // wheel out of range
+            &[RESOLUTION_MULTIPLIER_REPORT_ID, 0, 7][..],    // pan out of range
+        ] {
+            assert_eq!(handler.set_report(FEATURE, bad), OutResponse::Rejected, "{bad:?}");
+            assert_eq!(resolution_multipliers(), (1, 1), "state untouched by {bad:?}");
+        }
+
+        assert_eq!(
+            handler.set_report(ReportId::Feature(0x77), &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
+            OutResponse::Rejected
+        );
+        assert!(handler.get_report(ReportId::Feature(0x77), &mut [0u8; 8]).is_none());
+        assert_eq!(handler.set_report(ReportId::Out(0), &[1, 1]), OutResponse::Rejected);
+    }
+
+    /// Truncating the report would tell the host a multiplier it never set.
+    #[test]
+    fn get_needs_room_for_the_whole_numbered_report() {
+        reset_multipliers();
+        let mut handler = UsbCompositeRequestHandler::default();
+        for len in 0..3usize {
+            let mut buf = [0u8; 3];
+            assert!(
+                handler.get_report(FEATURE, &mut buf[..len]).is_none(),
+                "{len}-byte buffer"
+            );
+        }
+        let mut buf = [0u8; 3];
+        assert_eq!(handler.get_report(FEATURE, &mut buf), Some(3));
+    }
+
+    /// Only the composite interface declares the feature report.
+    #[test]
+    fn the_other_interfaces_reject_feature_reports() {
+        let mut handler = UsbRequestHandler::default();
+        assert_eq!(
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
+            OutResponse::Rejected
+        );
+    }
+
+    /// The negotiation belongs to one USB connection: after a reset or a
+    /// deconfiguration the host has to ask again, and until it does the device
+    /// is back to one unit per detent.
+    #[test]
+    fn the_connection_ending_drops_the_negotiation() {
+        let mut handler = UsbCompositeRequestHandler::default();
+        let mut device = UsbDeviceHandler::new();
+
+        // Checked as raw logical values: `enabled(false)` also takes USB out
+        // of the picture as a transport, which would mask the reset.
+        for end_the_connection in [
+            &UsbDeviceHandler::reset as &dyn Fn(&mut UsbDeviceHandler),
+            &|d: &mut UsbDeviceHandler| d.configured(false),
+            &|d: &mut UsbDeviceHandler| d.enabled(false),
+        ] {
+            handler.set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]);
+            assert_eq!(raw_multipliers(), (1, 1));
+            end_the_connection(&mut device);
+            assert_eq!(raw_multipliers(), (0, 0));
+        }
     }
 }

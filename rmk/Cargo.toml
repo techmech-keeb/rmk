@@ -211,6 +211,12 @@ st7735 = ["lcd_async"]
 st7789 = ["lcd_async"]
 st7796 = ["lcd_async"]
 
+## Enable high-resolution scrolling. Declares a HID Resolution Multiplier for
+## the wheel and pan axes, and once a USB host selects it every producer of
+## scroll motion emits that many units per detent instead of one. USB only:
+## HID over GATT has no feature report characteristic to negotiate through.
+hires_scroll = []
+
 ## Enable async matrix scanning
 async_matrix = []
 

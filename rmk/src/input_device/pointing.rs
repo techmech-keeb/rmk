@@ -602,11 +602,22 @@ impl<'a> PointingProcessor<'a> {
                         }
                     }
                     PointingMode::Scroll(scroll_config) => {
+                        // Hi-res scrolling asks for this many units per detent,
+                        // so divide the same motion into that many more steps:
+                        // the speed is unchanged, the steps get smaller. Both
+                        // are 1 until a host negotiates a multiplier.
+                        let (wheel_res, pan_res) = crate::hires::resolution_multipliers();
                         let (sx, sy) = self.accumulator.accumulate(
                             x,
                             y,
-                            (scroll_config.multiplier_x as u16, scroll_config.divisor_x as u16),
-                            (scroll_config.multiplier_y as u16, scroll_config.divisor_y as u16),
+                            (
+                                scroll_config.multiplier_x as u16 * pan_res as u16,
+                                scroll_config.divisor_x as u16,
+                            ),
+                            (
+                                scroll_config.multiplier_y as u16 * wheel_res as u16,
+                                scroll_config.divisor_y as u16,
+                            ),
                         );
                         if sx == 0 && sy == 0 {
                             return;
@@ -1490,6 +1501,97 @@ mod tests {
         };
         assert_eq!(-(10 * config.multiplier_x as i16), -10);
         assert_eq!(-(10 * config.multiplier_y as i16), -10);
+    }
+
+    /// Scroll mode is the reason hi-res exists: the same motion has to come
+    /// out as the same scrolling speed, split into the number of units the
+    /// host asked for. At the default divisor of 8 a single count of motion
+    /// produces nothing at all in detents, and 120/8 = 15 units at hi-res.
+    #[cfg(feature = "hires_scroll")]
+    #[test]
+    fn scroll_mode_splits_a_detent_into_the_units_the_host_asked_for() {
+        use rmk_types::action::KeyAction;
+        use rmk_types::connection::UsbState;
+
+        use crate::channel::USB_REPORT_CHANNEL;
+        use crate::config::{BehaviorConfig, PositionalConfig};
+        use crate::event::{AxisValType, PointingEvent};
+        use crate::hid::Report;
+        use crate::keymap::{KeyMap, KeymapData};
+        use crate::state::set_usb_state;
+        use crate::test_support::test_block_on as block_on;
+
+        fn motion_y(value: i16) -> PointingEvent {
+            let idle = AxisEvent {
+                typ: AxisValType::Rel,
+                axis: Axis::Z,
+                value: 0,
+            };
+            PointingEvent {
+                device_id: ALL_POINTING_DEVICES,
+                axes: [
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::X,
+                        value: 0,
+                    },
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::Y,
+                        value,
+                    },
+                    idle,
+                ],
+            }
+        }
+
+        fn wheel_of_next_report() -> Option<i16> {
+            match USB_REPORT_CHANNEL.try_receive() {
+                Ok(Report::MouseReport(r)) => Some(r.wheel),
+                Ok(_) => panic!("expected a mouse report"),
+                Err(_) => None,
+            }
+        }
+
+        let mut behavior = BehaviorConfig::default();
+        let positional: PositionalConfig<1, 1> = PositionalConfig::default();
+        let mut data: KeymapData<1, 1, 1, 0> = KeymapData::new([[[KeyAction::No]]]);
+        let keymap = block_on(KeyMap::new(&mut data, &mut behavior, &positional));
+        let mut processor = PointingProcessor::new(&keymap, PointingProcessorConfig::default());
+        processor.set_pointing_mode(PointingMode::Scroll(ScrollConfig::default()));
+
+        // USB is the transport, and the host has not asked for hi-res yet.
+        set_usb_state(UsbState::Configured);
+        USB_REPORT_CHANNEL.clear();
+        crate::hires::reset_multipliers();
+
+        // One count of motion is below a detent, so nothing goes out...
+        block_on(processor.on_pointing_event(motion_y(1)));
+        assert_eq!(wheel_of_next_report(), None);
+        // ...and the eighth count completes it (sensor +Y scrolls up).
+        for _ in 0..7 {
+            block_on(processor.on_pointing_event(motion_y(1)));
+        }
+        assert_eq!(wheel_of_next_report(), Some(-1));
+
+        // The host now asks for 120 units per detent. The same single count
+        // that used to produce nothing is worth 15 units, and eight of them
+        // still add up to exactly one detent.
+        processor.accumulator.reset();
+        crate::hires::set_raw_multipliers(1, 1);
+        let per_detent = crate::hid::RESOLUTION_MULTIPLIER_MAX as i16;
+        block_on(processor.on_pointing_event(motion_y(1)));
+        assert_eq!(wheel_of_next_report(), Some(-(per_detent / 8)));
+        for _ in 0..7 {
+            block_on(processor.on_pointing_event(motion_y(1)));
+        }
+        let mut total = -(per_detent / 8);
+        while let Some(wheel) = wheel_of_next_report() {
+            total += wheel;
+        }
+        assert_eq!(total, -per_detent, "eight counts are one detent either way");
+
+        crate::hires::reset_multipliers();
     }
 
     // === Integration tests for PointingProcessor ===
