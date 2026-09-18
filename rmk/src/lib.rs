@@ -117,7 +117,6 @@ pub mod driver;
 pub mod event;
 pub mod helper_macro;
 pub mod hid;
-pub mod hires;
 #[cfg(feature = "host")]
 pub mod host;
 pub mod input_device;
