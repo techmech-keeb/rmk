@@ -692,8 +692,9 @@ impl RequestHandler for UsbRequestHandler {
 
 /// Answers `GET_FEATURE` / `SET_FEATURE` for the Resolution Multiplier report
 /// on the composite interface — the one place a host can negotiate hi-res
-/// scrolling. The value itself lives in [`crate::hires`], because the
-/// producers that scale by it run in other tasks.
+/// scrolling. The value itself lives in [`crate::state`], beside the
+/// connection status, because the producers that scale by it run in other
+/// tasks.
 #[cfg(feature = "hires_scroll")]
 #[derive(Default)]
 pub(crate) struct UsbCompositeRequestHandler {}
@@ -707,7 +708,7 @@ impl RequestHandler for UsbCompositeRequestHandler {
         if id != ReportId::Feature(crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID) || buf.len() < 3 {
             return None;
         }
-        let (wheel, pan) = crate::hires::raw_multipliers();
+        let (wheel, pan) = crate::state::raw_multipliers();
         buf[0] = crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID;
         buf[1] = wheel;
         buf[2] = pan;
@@ -727,7 +728,7 @@ impl RequestHandler for UsbCompositeRequestHandler {
         if report_id != crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID || wheel > 1 || pan > 1 {
             return OutResponse::Rejected;
         }
-        crate::hires::set_raw_multipliers(wheel, pan);
+        crate::state::set_raw_multipliers(wheel, pan);
         info!("Resolution multiplier set: wheel={} pan={}", wheel, pan);
         OutResponse::Accepted
     }
@@ -753,7 +754,7 @@ impl Handler for UsbDeviceHandler {
     fn enabled(&mut self, enabled: bool) {
         #[cfg(feature = "hires_scroll")]
         if !enabled {
-            crate::hires::reset_multipliers();
+            crate::state::reset_multipliers();
         }
         if enabled {
             info!("Device enabled");
@@ -766,7 +767,7 @@ impl Handler for UsbDeviceHandler {
 
     fn reset(&mut self) {
         #[cfg(feature = "hires_scroll")]
-        crate::hires::reset_multipliers();
+        crate::state::reset_multipliers();
         self.pre_suspend = UsbState::Enabled;
         set_usb_state(UsbState::Enabled);
         info!("Bus reset, the Vbus current limit is 100mA");
@@ -779,7 +780,7 @@ impl Handler for UsbDeviceHandler {
     fn configured(&mut self, configured: bool) {
         #[cfg(feature = "hires_scroll")]
         if !configured {
-            crate::hires::reset_multipliers();
+            crate::state::reset_multipliers();
         }
         if configured {
             set_usb_state(UsbState::Configured);
@@ -963,8 +964,7 @@ mod resolution_multiplier_tests {
 
     use super::{UsbCompositeRequestHandler, UsbDeviceHandler, UsbRequestHandler};
     use crate::hid::{RESOLUTION_MULTIPLIER_MAX, RESOLUTION_MULTIPLIER_REPORT_ID};
-    use crate::hires::{raw_multipliers, reset_multipliers, resolution_multipliers};
-    use crate::state::set_usb_state;
+    use crate::state::{raw_multipliers, reset_multipliers, resolution_multipliers, set_usb_state};
 
     const FEATURE: ReportId = ReportId::Feature(RESOLUTION_MULTIPLIER_REPORT_ID);
 
