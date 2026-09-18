@@ -606,7 +606,7 @@ impl<'a> PointingProcessor<'a> {
                         // so divide the same motion into that many more steps:
                         // the speed is unchanged, the steps get smaller. Both
                         // are 1 until a host negotiates a multiplier.
-                        let (wheel_res, pan_res) = crate::hires::resolution_multipliers();
+                        let (wheel_res, pan_res) = crate::state::resolution_multipliers();
                         let (sx, sy) = self.accumulator.accumulate(
                             x,
                             y,
@@ -1563,7 +1563,7 @@ mod tests {
         // USB is the transport, and the host has not asked for hi-res yet.
         set_usb_state(UsbState::Configured);
         USB_REPORT_CHANNEL.clear();
-        crate::hires::reset_multipliers();
+        crate::state::reset_multipliers();
 
         // One count of motion is below a detent, so nothing goes out...
         block_on(processor.on_pointing_event(motion_y(1)));
@@ -1578,7 +1578,7 @@ mod tests {
         // that used to produce nothing is worth 15 units, and eight of them
         // still add up to exactly one detent.
         processor.accumulator.reset();
-        crate::hires::set_raw_multipliers(1, 1);
+        crate::state::set_raw_multipliers(1, 1);
         let per_detent = crate::hid::RESOLUTION_MULTIPLIER_MAX as i16;
         block_on(processor.on_pointing_event(motion_y(1)));
         assert_eq!(wheel_of_next_report(), Some(-(per_detent / 8)));
@@ -1591,7 +1591,7 @@ mod tests {
         }
         assert_eq!(total, -per_detent, "eight counts are one detent either way");
 
-        crate::hires::reset_multipliers();
+        crate::state::reset_multipliers();
     }
 
     // === Integration tests for PointingProcessor ===
