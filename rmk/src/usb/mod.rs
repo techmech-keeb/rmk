@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use embassy_futures::join::join5;
 use embassy_futures::select::{Either, select};
 use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant};
 #[cfg(feature = "usb_log")]
 use embassy_usb::class::cdc_acm::CdcAcmClass;
 use embassy_usb::class::hid::{HidProtocolMode, HidReader, HidReaderWriter, HidWriter, ReportId, RequestHandler};
@@ -747,18 +748,26 @@ impl RequestHandler for UsbCompositeRequestHandler {
     }
 }
 
+// VENDOR PATCH (olsk60, hi-res scroll): a bus reset this soon after a resume
+// is the host finishing that resume, not a new session (see `reset()`).
+// RP2040 reports the resume before the reset when a reset wakes the bus.
+const RESET_RESUME_WINDOW: Duration = Duration::from_secs(2);
+
 pub(crate) struct UsbDeviceHandler {
     /// State to restore on resume. Only a Configured device is ever published as
     /// Suspended (see `suspended()`), so this always holds Configured while the
     /// device is suspended; kept as a snapshot rather than a hardcoded value so
     /// resume stays correct if another pre-suspend state becomes publishable.
     pre_suspend: UsbState,
+    /// When the device last left a Suspended state.
+    resumed_at: Option<Instant>,
 }
 
 impl UsbDeviceHandler {
     fn new() -> Self {
         UsbDeviceHandler {
             pre_suspend: UsbState::Disabled,
+            resumed_at: None,
         }
     }
 }
@@ -778,7 +787,20 @@ impl Handler for UsbDeviceHandler {
     }
 
     fn reset(&mut self) {
-        reset_resolution_multipliers();
+        // Many hosts resume from system sleep by resetting the port, then
+        // restore address and configuration without renegotiating the
+        // multiplier (Windows never does; Linux only since 6.19). Dropping to 1
+        // there leaves the host dividing detent counts by the old multiplier,
+        // so scrolling crawls until replug. A reset that ends a suspend keeps
+        // the value; any other reset starts a new session at 1. Suspended
+        // stays published until `configured(true)`, so every reset of one
+        // reset-resume enumeration counts.
+        let ends_suspend = current_usb_state() == UsbState::Suspended
+            || self.resumed_at.is_some_and(|t| t.elapsed() < RESET_RESUME_WINDOW);
+        self.resumed_at = None;
+        if !ends_suspend {
+            reset_resolution_multipliers();
+        }
         info!("Bus reset, the Vbus current limit is 100mA");
     }
 
@@ -825,6 +847,7 @@ impl Handler for UsbDeviceHandler {
             // callbacks), don't overwrite — `configured()`/`enabled()` will resync.
             if current_usb_state() == UsbState::Suspended {
                 set_usb_state(self.pre_suspend);
+                self.resumed_at = Some(Instant::now());
             }
             info!(
                 "Device resumed, the Vbus current limit is 500µA (or 2.5mA for high-power devices with remote wakeup enabled)."
@@ -1041,6 +1064,81 @@ mod resolution_multiplier_tests {
 
         // What UsbDeviceHandler::reset, configured(false) and enabled(false) call.
         reset_resolution_multipliers();
+        assert_eq!(resolution_multipliers(), (1, 1));
+    }
+
+    /// An enumerated device with hi-res negotiated, as a host leaves it.
+    fn negotiated_device() -> UsbDeviceHandler {
+        reset_resolution_multipliers();
+        let mut device = UsbDeviceHandler::new();
+        device.enabled(true);
+        device.configured(true);
+        assert_eq!(
+            UsbCompositeRequestHandler::default().set_report(FEATURE, &[RESOLUTION_MULTIPLIER_REPORT_ID, 1, 1]),
+            OutResponse::Accepted
+        );
+        device
+    }
+
+    const NEGOTIATED: (u8, u8) = (RESOLUTION_MULTIPLIER_MAX, RESOLUTION_MULTIPLIER_MAX);
+
+    /// Reset-resume without a resume event: the reset itself wakes the bus.
+    /// The host re-enumerates (often with two resets) and never sends
+    /// SET_FEATURE again, so the device must still be at the host's value.
+    #[test]
+    fn resets_while_suspended_keep_the_multiplier() {
+        let mut device = negotiated_device();
+        device.suspended(true);
+
+        device.reset();
+        device.reset();
+        device.configured(true);
+        assert_eq!(resolution_multipliers(), NEGOTIATED);
+    }
+
+    /// Reset-resume as RP2040 reports it: resume first, reset right after.
+    #[test]
+    fn reset_right_after_resume_keeps_the_multiplier() {
+        let mut device = negotiated_device();
+        device.suspended(true);
+        device.suspended(false);
+        embassy_time::MockDriver::get().advance(Duration::from_millis(50));
+
+        device.reset();
+        device.configured(true);
+        assert_eq!(resolution_multipliers(), NEGOTIATED);
+    }
+
+    /// Long after a plain resume, a reset is a new session (another host, a
+    /// reboot): it may never negotiate, so it must get detent.
+    #[test]
+    fn reset_long_after_resume_drops_back_to_detent() {
+        let mut device = negotiated_device();
+        device.suspended(true);
+        device.suspended(false);
+        embassy_time::MockDriver::get().advance(RESET_RESUME_WINDOW);
+
+        device.reset();
+        assert_eq!(resolution_multipliers(), (1, 1));
+    }
+
+    #[test]
+    fn reset_of_a_running_device_drops_back_to_detent() {
+        let mut device = negotiated_device();
+        device.reset();
+        assert_eq!(resolution_multipliers(), (1, 1));
+    }
+
+    /// Once a reset-resume has finished enumerating, the next reset is a new
+    /// session again.
+    #[test]
+    fn reset_after_a_finished_reset_resume_drops_back_to_detent() {
+        let mut device = negotiated_device();
+        device.suspended(true);
+        device.reset();
+        device.configured(true);
+
+        device.reset();
         assert_eq!(resolution_multipliers(), (1, 1));
     }
 
