@@ -303,6 +303,18 @@ impl MouseState {
         r
     }
 
+    // VENDOR PATCH (olsk60, hi-res scroll): mouse keys count wheel and pan in
+    // detents, but a host that enabled a Resolution Multiplier reads every
+    // unit as 1/multiplier of a detent. Scaling here keeps one key repeat
+    // worth the same detents with or without hi-res scrolling.
+    /// Converts the detent-based wheel and pan of a mouse key report into the
+    /// host's negotiated (wheel, pan) resolution multipliers.
+    pub fn scale_to_resolution(mut report: MouseReport, (wheel, pan): (u8, u8)) -> MouseReport {
+        report.wheel = report.wheel.saturating_mul(wheel as i8);
+        report.pan = report.pan.saturating_mul(pan as i8);
+        report
+    }
+
     /// Two-step speed calculation:
     /// Step 1: acceleration curve based on repeat count
     /// Step 2: accel multiplier (Accel0=0.25x, Accel1=0.5x, Accel2=2.0x, highest wins)
@@ -407,6 +419,52 @@ mod test {
 
     fn default_config() -> MouseKeyConfig {
         MouseKeyConfig::default()
+    }
+
+    // -- Resolution Multiplier ------------------------------------------------
+
+    fn wheel_report(wheel: i8, pan: i8) -> MouseReport {
+        MouseReport {
+            buttons: 1,
+            x: 3,
+            y: -2,
+            wheel,
+            pan,
+        }
+    }
+
+    #[test]
+    fn scale_to_resolution_multiplies_wheel_and_pan_only() {
+        let r = MouseState::scale_to_resolution(wheel_report(-2, 1), (30, 12));
+        assert_eq!((r.wheel, r.pan), (-60, 12));
+        assert_eq!((r.buttons, r.x, r.y), (1, 3, -2));
+    }
+
+    #[test]
+    fn scale_to_resolution_is_identity_without_hires() {
+        let r = MouseState::scale_to_resolution(wheel_report(4, -4), (1, 1));
+        assert_eq!((r.wheel, r.pan), (4, -4));
+    }
+
+    #[test]
+    fn scale_to_resolution_saturates_instead_of_wrapping() {
+        let r = MouseState::scale_to_resolution(wheel_report(5, -5), (30, 30));
+        assert_eq!((r.wheel, r.pan), (i8::MAX, i8::MIN));
+    }
+
+    #[test]
+    fn default_wheel_ceiling_fits_a_30x_multiplier() {
+        // The largest unit the default config can emit, Accel2 included, must
+        // survive scaling to the hi-res maximum without saturating.
+        let config = default_config();
+        let r = MouseState::scale_to_resolution(
+            wheel_report(config.wheel_max as i8, 0),
+            (crate::hid::RESOLUTION_MULTIPLIER_MAX, 1),
+        );
+        assert_eq!(
+            r.wheel as i16,
+            config.wheel_max as i16 * crate::hid::RESOLUTION_MULTIPLIER_MAX as i16
+        );
     }
 
     // -- A. Basic press/release -----------------------------------------------
