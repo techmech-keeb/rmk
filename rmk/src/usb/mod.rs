@@ -761,6 +761,9 @@ pub(crate) struct UsbDeviceHandler {
     pre_suspend: UsbState,
     /// When the device last left a Suspended state.
     resumed_at: Option<Instant>,
+    /// A reset-resume enumeration is in progress: the host woke the bus with a
+    /// reset and has not sent SET_CONFIGURATION yet.
+    reset_resume: bool,
 }
 
 impl UsbDeviceHandler {
@@ -768,6 +771,7 @@ impl UsbDeviceHandler {
         UsbDeviceHandler {
             pre_suspend: UsbState::Disabled,
             resumed_at: None,
+            reset_resume: false,
         }
     }
 }
@@ -775,6 +779,7 @@ impl UsbDeviceHandler {
 impl Handler for UsbDeviceHandler {
     fn enabled(&mut self, enabled: bool) {
         if !enabled {
+            self.reset_resume = false;
             reset_resolution_multipliers();
         }
         if enabled {
@@ -792,12 +797,15 @@ impl Handler for UsbDeviceHandler {
         // multiplier (Windows never does; Linux only since 6.19). Dropping to 1
         // there leaves the host dividing detent counts by the old multiplier,
         // so scrolling crawls until replug. A reset that ends a suspend keeps
-        // the value; any other reset starts a new session at 1. Suspended
-        // stays published until `configured(true)`, so every reset of one
-        // reset-resume enumeration counts.
-        let ends_suspend = current_usb_state() == UsbState::Suspended
+        // the value; any other reset starts a new session at 1. A resume event
+        // restores the pre-suspend state right away, so `reset_resume` carries
+        // the decision over the further resets of the same enumeration (hosts
+        // often reset twice) until `configured(true)` ends it.
+        let ends_suspend = self.reset_resume
+            || current_usb_state() == UsbState::Suspended
             || self.resumed_at.is_some_and(|t| t.elapsed() < RESET_RESUME_WINDOW);
         self.resumed_at = None;
+        self.reset_resume = ends_suspend;
         if !ends_suspend {
             reset_resolution_multipliers();
         }
@@ -809,6 +817,7 @@ impl Handler for UsbDeviceHandler {
     }
 
     fn configured(&mut self, configured: bool) {
+        self.reset_resume = false;
         if !configured {
             reset_resolution_multipliers();
         }
@@ -1111,6 +1120,28 @@ mod resolution_multiplier_tests {
 
     /// Long after a plain resume, a reset is a new session (another host, a
     /// reboot): it may never negotiate, so it must get detent.
+    /// A reset-resume with a resume event and two resets. The resume already
+    /// restored the pre-suspend state and the first reset consumed the resume
+    /// time, so only the enumeration flag keeps the second reset on the keep
+    /// side, however late it comes.
+    #[test]
+    fn second_reset_of_a_reset_resume_keeps_the_multiplier() {
+        let mut device = negotiated_device();
+        device.suspended(true);
+        device.suspended(false);
+        embassy_time::MockDriver::get().advance(Duration::from_millis(50));
+
+        device.reset();
+        embassy_time::MockDriver::get().advance(RESET_RESUME_WINDOW * 2);
+        device.reset();
+        assert_eq!(resolution_multipliers(), NEGOTIATED);
+
+        device.configured(true);
+        assert_eq!(resolution_multipliers(), NEGOTIATED);
+        device.reset();
+        assert_eq!(resolution_multipliers(), (1, 1));
+    }
+
     #[test]
     fn reset_long_after_resume_drops_back_to_detent() {
         let mut device = negotiated_device();
