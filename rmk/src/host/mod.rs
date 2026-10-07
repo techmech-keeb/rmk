@@ -1,4 +1,5 @@
 pub(crate) mod context;
+pub mod custom_value;
 // Physical-presence unlock gate, shared by the Vial (`vial` + `host_lock`)
 // and Rynk (`rynk` ⇒ `host_lock`) services.
 #[cfg(feature = "host_lock")]

@@ -7,6 +7,7 @@ use vial::process_vial;
 use crate::config::{RmkConfig, VialConfig};
 use crate::hid::ViaReport;
 use crate::host::context::KeyboardContext;
+use crate::host::custom_value::{self, CustomValueCommand};
 use crate::host::via::keycode_convert::{from_via_keycode, to_via_keycode};
 use crate::keymap::KeyMap;
 use crate::{MACRO_MAX_NUM, MACRO_SPACE_SIZE, boot};
@@ -125,18 +126,10 @@ impl<'a> VialService<'a> {
             ViaCommand::DynamicKeymapReset => {
                 warn!("Dynamic keymap reset -- not supported")
             }
-            ViaCommand::CustomSetValue => {
-                // backlight/rgblight/rgb matrix/led matrix/audio settings here
-                warn!("Custom set value -- not supported")
-            }
-            ViaCommand::CustomGetValue => {
-                // backlight/rgblight/rgb matrix/led matrix/audio settings here
-                warn!("Custom get value -- not supported")
-            }
-            ViaCommand::CustomSave => {
-                // backlight/rgblight/rgb matrix/led matrix/audio settings here
-                warn!("Custom get value -- not supported")
-            }
+            // VENDOR PATCH (olsk60): the keyboard serves these on its own channels.
+            ViaCommand::CustomSetValue => custom_value::dispatch(CustomValueCommand::Set, &mut report.input_data),
+            ViaCommand::CustomGetValue => custom_value::dispatch(CustomValueCommand::Get, &mut report.input_data),
+            ViaCommand::CustomSave => custom_value::dispatch(CustomValueCommand::Save, &mut report.input_data),
             ViaCommand::EepromReset => {
                 warn!("Resetting storage..");
                 self.ctx.reset_storage().await;
