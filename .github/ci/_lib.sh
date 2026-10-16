@@ -49,6 +49,8 @@ RMK_FEATURESETS=(
     "passkey_entry"
     "split,vial,storage,passkey_entry"
     "vial,storage,steno"
+    "vial,storage,hires_scroll"
+    "vial,storage,async_matrix,_ble,hires_scroll"
     "split,vial,storage,async_matrix,_ble,steno"
     "split,vial,storage,async_matrix,_ble,subrating"
     "rynk,_ble,split,storage,async_matrix"
@@ -70,6 +72,7 @@ RMK_TEST_FEATURESETS=(
     "rynk,_ble,split,async_matrix,storage"
     "_ble,ext_adv,split,storage,async_matrix"
     "dongle,vial,_ble,ext_adv,storage,custom_message"
+    "vial,storage,async_matrix,_ble,hires_scroll"
     "dongle,_ble,storage,custom_message"
     "dongle,vial,_ble,storage,custom_message"
 )
