@@ -357,6 +357,9 @@ pub(crate) const SCHEMA_HASH: u32 = {
     hash = fnv_hash(hash, env!("RMK_COMMIT").as_bytes());
     // Features gate variants of the two enums, shifting their postcard tags.
     hash = fnv_hash(hash, env!("RMK_FEATURES").as_bytes());
+    // VENDOR PATCH: the whole keyboard.toml, so a stored keymap never lands on the
+    // layers of a different layout. Upstream lets stored edits outrank any rebuild.
+    hash = fnv_hash(hash, &crate::KEYBOARD_TOML_HASH.to_le_bytes());
     // `keyboard.toml` sizes decide how a stored value is framed.
     #[cfg(feature = "host")]
     {

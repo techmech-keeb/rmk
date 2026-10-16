@@ -40,7 +40,19 @@ fn main() {
     let bc = config
         .build_constants(&feature_refs)
         .unwrap_or_else(|err| panic!("Failed to resolve build constants: {err}"));
-    let output = generate_constants(&bc, &config);
+    let mut output = generate_constants(&bc, &config);
+    // VENDOR PATCH: rmk folds this into its storage schema hash, so a firmware built
+    // from another keyboard.toml (another layer count, say) starts from fresh storage
+    // instead of reading the old layout's keys into its own layers.
+    let toml_hash = toml_path
+        .as_deref()
+        .and_then(|path| fs::read(path).ok())
+        .map_or(0, |bytes| {
+            bytes.iter().fold(0x811c_9dc5u32, |hash, &byte| {
+                (hash ^ byte as u32).wrapping_mul(0x0100_0193)
+            })
+        });
+    output.push_str(&format!("\npub const KEYBOARD_TOML_HASH: u32 = {toml_hash:#010x};\n"));
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("constants.rs");
