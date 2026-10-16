@@ -24,12 +24,25 @@ impl<F: AsyncNorFlash> Storage<F> {
             .await
             .map_err(|e| print_storage_error::<F>(e))?;
 
-        // Read all keymap keys and encoder configs
-        while let Some((key, value)) = key_iterator
-            .next::<StorageValue>(&mut self.buffer)
-            .await
-            .map_err(|e| print_storage_error::<F>(e))?
-        {
+        // Read all keymap keys and encoder configs.
+        //
+        // VENDOR PATCH: skip an item whose key or value does not decode instead of
+        // ending the scan. The iterator visits every item ever written, so one foreign
+        // or damaged entry used to drop every item after it (the newest edits) and turn
+        // the whole read into an error. Flash I/O errors still end the scan.
+        loop {
+            let (key, value) = match key_iterator.next::<StorageValue>(&mut self.buffer).await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(sequential_storage::Error::SerializationError(e)) => {
+                    warn!("Skipping a stored item whose key or value does not decode: {:?}", e);
+                    continue;
+                }
+                Err(e) => {
+                    print_storage_error::<F>(e);
+                    return Err(());
+                }
+            };
             match (key, value) {
                 (StorageKey::Keymap { layer, row, col }, StorageValue::KeyAction(action)) => {
                     let layer = layer as usize;

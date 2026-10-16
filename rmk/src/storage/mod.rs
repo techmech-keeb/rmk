@@ -885,6 +885,54 @@ mod tests {
         });
     }
 
+    /// One item that no longer decodes (a foreign encoding, a damaged write) must not
+    /// cost the items after it: those are the newest edits.
+    #[cfg(feature = "host")]
+    #[test]
+    fn an_undecodable_item_does_not_end_the_keymap_scan() {
+        use rmk_types::action::Action;
+        use rmk_types::keycode::{HidKeyCode, KeyCode};
+
+        use crate::keymap::KeymapData;
+
+        let key = |k| KeyAction::Single(Action::Key(KeyCode::Hid(k)));
+        let mut behavior = RuntimeBehaviorConfig::default();
+
+        block_on(async {
+            let mut map = MapStorage::<StorageKey, _, _>::new(
+                async_flash_wrapper(Part::new()),
+                MapConfig::new(STORAGE_RANGE),
+                Cache::new_uncached(),
+            );
+            let mut buffer = [0u8; 256];
+            let keymap = |col, action| {
+                (
+                    StorageKey::Keymap { layer: 0, row: 0, col },
+                    StorageValue::KeyAction(action),
+                )
+            };
+            for (k, v) in [
+                (StorageKey::StorageConfig, StorageValue::StorageConfig(SCHEMA_HASH)),
+                keymap(0, key(HidKeyCode::A)),
+            ] {
+                map.store_item(&mut buffer, &k, &v).await.unwrap();
+            }
+            // No `StorageValue` variant has this tag.
+            let garbage: &[u8] = &[0xFF, 0xFF, 0xFF, 0x0F];
+            map.store_item(&mut buffer, &StorageKey::LayoutOption, &garbage)
+                .await
+                .unwrap();
+            let (k, v) = keymap(1, key(HidKeyCode::B));
+            map.store_item(&mut buffer, &k, &v).await.unwrap();
+
+            let mut storage = new_storage(map.destroy().0).await;
+            let none = KeyAction::No;
+            let mut data = KeymapData::new([[[none, none]]]);
+            assert_eq!(storage.read_layout(&mut data, &mut behavior).await, Ok(()));
+            assert_eq!(data.keymap[0][0], [key(HidKeyCode::A), key(HidKeyCode::B)]);
+        });
+    }
+
     #[test]
     fn store_reports_its_own_failure() {
         let part = Part::new();
