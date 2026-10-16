@@ -5,10 +5,7 @@ use rmk_types::action::{EncoderAction, KeyAction, TouchAction, TouchGesture};
 use rmk_types::fork::Fork;
 use rmk_types::morse::{Morse, MorseProfile};
 #[cfg(all(feature = "storage", feature = "host"))]
-use {
-    crate::{boot::reboot_keyboard, storage::Storage},
-    embedded_storage_async::nor_flash::NorFlash,
-};
+use {crate::storage::Storage, embedded_storage_async::nor_flash::NorFlash};
 
 use crate::config::{BehaviorConfig, Hand, MouseKeyConfig, OneShotModifiersConfig, PositionalConfig};
 use crate::event::{KeyboardEvent, KeyboardEventSource, LayerChangeEvent, publish_event};
@@ -502,9 +499,11 @@ impl<'a> KeyMap<'a> {
                 debug!("`clear_layout` is set, rewriting the items the compiled-in layout owns.");
                 storage.write_layout(data, behavior).await;
             } else if storage.read_layout(data, behavior).await.is_err() {
-                error!("Failed to read from storage, clearing...");
-                storage.flash.erase_all().await.ok();
-                reboot_keyboard();
+                // VENDOR PATCH: keep the flash. Erasing here wiped every keymap edit,
+                // setting and bond over one unreadable item, and the reboot hid it from
+                // in-RAM diagnostics. What could not be read keeps its compiled-in
+                // default; a deliberate reset (Vial EepromReset, `clear_storage`) remains.
+                error!("Failed to read from storage; keeping flash contents and using defaults");
             }
         }
 
