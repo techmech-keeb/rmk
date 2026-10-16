@@ -100,7 +100,7 @@ pub(crate) fn reset() -> impl Future<Output = ()> {
 
 /// The most one user slot holds. Changing it reframes stored values, but the new
 /// commit also changes [`SCHEMA_HASH`], so the next boot reinitializes on its own.
-pub const USER_DATA_MAX_SIZE: usize = 16;
+pub const USER_DATA_MAX_SIZE: usize = 32;
 
 /// Persist user-defined `bytes` in board-defined slot `slot`. RMK never looks inside one.
 ///
@@ -109,6 +109,26 @@ pub async fn store_user_data(slot: u8, bytes: &[u8]) -> Result<(), heapless::Cap
     let data = heapless::Vec::from_slice(bytes)?;
     store_unchecked(StorageItem::UserData { slot, data }).await;
     Ok(())
+}
+
+/// Why a user slot could not be written or read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum UserDataError {
+    /// More than [`USER_DATA_MAX_SIZE`] bytes.
+    TooLong,
+    /// The flash access failed, or the stored item is not user data.
+    Storage,
+}
+
+/// Like [`store_user_data`], but resolves only once the write has landed on flash, so a
+/// caller can keep the data marked unsaved and retry instead of trusting a lost write.
+pub async fn store_user_data_confirmed(slot: u8, bytes: &[u8]) -> Result<(), UserDataError> {
+    let data = heapless::Vec::from_slice(bytes).map_err(|_| UserDataError::TooLong)?;
+    store(StorageItem::UserData { slot, data })
+        .await
+        .map(|_| ())
+        .map_err(|()| UserDataError::Storage)
 }
 
 /// Read back slot `slot`, `None` if nothing was ever stored there.
@@ -382,6 +402,21 @@ pub struct Storage<F: AsyncNorFlash> {
 }
 
 impl<F: AsyncNorFlash> Storage<F> {
+    /// Read slot `slot` straight from flash, before the storage task runs.
+    ///
+    /// `Ok(None)` when nothing was ever stored there, `Err` when the item could not
+    /// be read or decoded, so a board can tell a fresh keyboard from a broken read.
+    pub async fn read_user_data(
+        &mut self,
+        slot: u8,
+    ) -> Result<Option<heapless::Vec<u8, USER_DATA_MAX_SIZE>>, UserDataError> {
+        match self.fetch(StorageKey::UserData(slot)).await {
+            Ok(None) => Ok(None),
+            Ok(Some(StorageValue::UserData(data))) => Ok(Some(data)),
+            Ok(Some(_)) | Err(()) => Err(UserDataError::Storage),
+        }
+    }
+
     pub(crate) async fn fetch(&mut self, key: StorageKey) -> Result<Option<StorageValue>, ()> {
         self.flash
             .fetch_item(&mut self.buffer, &key)
@@ -789,6 +824,63 @@ mod tests {
             assert!(
                 store_user_data(3, &[0; USER_DATA_MAX_SIZE + 1]).await.is_err(),
                 "too long for a slot, and nothing is written"
+            );
+        });
+    }
+
+    /// A board saving its settings has to learn when a write is lost, or it marks them
+    /// saved and the next power cycle restores the old values.
+    #[test]
+    fn a_confirmed_user_data_write_reports_failure() {
+        let part = Part::new();
+        with_storage_task(part.clone(), async {
+            let block = [0x5A; USER_DATA_MAX_SIZE];
+            assert_eq!(store_user_data_confirmed(0, &block).await, Ok(()));
+            assert_eq!(read_user_data(0).await.as_deref(), Some(&block[..]));
+
+            part.fail_writes(true);
+            assert_eq!(store_user_data_confirmed(0, &[1]).await, Err(UserDataError::Storage));
+            part.fail_writes(false);
+            assert_eq!(
+                read_user_data(0).await.as_deref(),
+                Some(&block[..]),
+                "the old value stands"
+            );
+
+            assert_eq!(
+                store_user_data_confirmed(0, &[0; USER_DATA_MAX_SIZE + 1]).await,
+                Err(UserDataError::TooLong),
+                "too long for a slot"
+            );
+        });
+    }
+
+    /// Boards load their settings before the storage task runs, and must tell a fresh
+    /// keyboard (nothing stored) from an item they cannot read.
+    #[test]
+    fn user_data_reads_straight_from_flash_before_the_task_runs() {
+        block_on(async {
+            let block = [0xA5; USER_DATA_MAX_SIZE];
+            let flash = seeded(&[
+                (StorageKey::StorageConfig, StorageValue::StorageConfig(SCHEMA_HASH)),
+                (
+                    StorageKey::UserData(0),
+                    StorageValue::UserData(heapless::Vec::from_slice(&block).unwrap()),
+                ),
+                (
+                    StorageKey::UserData(1),
+                    StorageValue::ConnectionType(ConnectionType::Ble),
+                ),
+            ])
+            .await;
+            let mut storage = new_storage(flash).await;
+
+            assert_eq!(storage.read_user_data(0).await.unwrap().as_deref(), Some(&block[..]));
+            assert_eq!(storage.read_user_data(2).await, Ok(None), "never stored");
+            assert_eq!(
+                storage.read_user_data(1).await,
+                Err(UserDataError::Storage),
+                "not user data"
             );
         });
     }
