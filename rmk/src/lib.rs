@@ -54,6 +54,14 @@ compile_error!("feature `dfu_ext` requires the `_dfu` feature — enable `dfu_rp
 #[cfg(all(feature = "dfu_lock", not(feature = "_dfu")))]
 compile_error!("feature `dfu_lock` requires the `_dfu` feature — enable `dfu_rp` or `dfu_nrf`");
 
+#[cfg(all(feature = "hires_scroll", feature = "_no_usb"))]
+compile_error!("feature `hires_scroll` negotiates over USB, so it does nothing in a `_no_usb` build");
+
+#[cfg(all(feature = "hires_scroll", feature = "dongle"))]
+compile_error!(
+    "feature `hires_scroll` is not supported on a dongle: the dongle forwards the reports its peripheral sends in detents, so declaring a multiplier would make the host scroll that many times slower"
+);
+
 // Re-export self as ::rmk for macro-generated code to work both inside and outside the crate
 extern crate self as rmk;
 
@@ -109,6 +117,7 @@ pub mod driver;
 pub mod event;
 pub mod helper_macro;
 pub mod hid;
+pub mod hires;
 #[cfg(feature = "host")]
 pub mod host;
 pub mod input_device;
