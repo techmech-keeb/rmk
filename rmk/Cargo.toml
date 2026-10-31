@@ -87,6 +87,9 @@ usb_log = ["dep:embassy-usb-logger", "log"]
 # Keep a log of USB bus events and control requests for diagnosing host
 # behaviour (rmk::usb::diag). Off by default; adds no code when off.
 usb_diag = []
+## Let the board carry HID reports over a link of its own (`channel::EXTERNAL_REPORT_CHANNEL`,
+## switched with `state::set_external_transport`) while USB is not in use
+external_transport = []
 ## Use log, this feature cannot be enabled when defmt is enabled
 log = ["dep:log", "trouble-host?/log"]
 

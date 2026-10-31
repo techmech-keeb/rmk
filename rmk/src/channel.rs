@@ -33,6 +33,12 @@ pub static USB_REPORT_CHANNEL: ReportChannel = Channel::new();
 #[cfg(feature = "_ble")]
 pub static BLE_REPORT_CHANNEL: ReportChannel = Channel::new();
 
+/// Drained by a transport the board provides itself. Reports go here while the
+/// board reports that link as connected and USB is not ready
+/// ([`crate::state::set_external_transport`]); USB wins when both are up.
+#[cfg(feature = "external_transport")]
+pub static EXTERNAL_REPORT_CHANNEL: ReportChannel = Channel::new();
+
 fn report_channel(transport: ConnectionType) -> Option<&'static ReportChannel> {
     match transport {
         #[cfg(not(feature = "_no_usb"))]
@@ -44,14 +50,17 @@ fn report_channel(transport: ConnectionType) -> Option<&'static ReportChannel> {
     }
 }
 
-fn active_report_channel() -> Option<(ConnectionType, &'static ReportChannel)> {
-    let transport = crate::state::active_transport()?;
-    report_channel(transport).map(|ch| (transport, ch))
+fn active_report_channel() -> Option<&'static ReportChannel> {
+    #[cfg(feature = "external_transport")]
+    if crate::state::external_transport_active() {
+        return Some(&EXTERNAL_REPORT_CHANNEL);
+    }
+    report_channel(crate::state::active_transport()?)
 }
 
 /// Reports generated while no transport is selected are dropped on the floor.
 pub(crate) async fn send_hid_report(mut report: Report) {
-    let Some((transport, ch)) = active_report_channel() else {
+    let Some(ch) = active_report_channel() else {
         return;
     };
 
@@ -62,7 +71,7 @@ pub(crate) async fn send_hid_report(mut report: Report) {
         }
 
         poll_fn(|cx| ch.poll_ready_to_send(cx)).await;
-        if crate::state::active_transport() != Some(transport) {
+        if !active_report_channel().is_some_and(|active| core::ptr::eq(active, ch)) {
             return;
         }
     }
@@ -72,7 +81,7 @@ pub(crate) async fn send_hid_report(mut report: Report) {
 /// task. A dropped report can lose or merge a stroke on the host; the next
 /// report still restates every held key because steno reports are absolute.
 pub(crate) fn try_send_hid_report(report: Report) {
-    if let Some((_, ch)) = active_report_channel() {
+    if let Some(ch) = active_report_channel() {
         let _ = ch.try_send(report);
     }
 }
@@ -82,17 +91,27 @@ pub(crate) fn try_send_hid_report(report: Report) {
 /// releases any pressed keys and buttons without replaying stale queued reports later.
 pub(crate) fn clear_and_release_report_channel(transport: ConnectionType) {
     if let Some(ch) = report_channel(transport) {
-        ch.clear();
-        for report in [
-            Report::KeyboardReport(KeyboardReport::default()),
-            Report::MouseReport(MouseReport::default()),
-            Report::MediaKeyboardReport(MediaKeyboardReport { usage_id: 0 }),
-            Report::SystemControlReport(SystemControlReport { usage_id: 0 }),
-            #[cfg(feature = "steno")]
-            Report::StenoReport(StenoReport::default()),
-        ] {
-            let _ = ch.try_send(report);
-        }
+        clear_and_release(ch);
+    }
+}
+
+/// [`clear_and_release_report_channel`] for [`EXTERNAL_REPORT_CHANNEL`].
+#[cfg(feature = "external_transport")]
+pub(crate) fn clear_and_release_external_report_channel() {
+    clear_and_release(&EXTERNAL_REPORT_CHANNEL);
+}
+
+fn clear_and_release(ch: &ReportChannel) {
+    ch.clear();
+    for report in [
+        Report::KeyboardReport(KeyboardReport::default()),
+        Report::MouseReport(MouseReport::default()),
+        Report::MediaKeyboardReport(MediaKeyboardReport { usage_id: 0 }),
+        Report::SystemControlReport(SystemControlReport { usage_id: 0 }),
+        #[cfg(feature = "steno")]
+        Report::StenoReport(StenoReport::default()),
+    ] {
+        let _ = ch.try_send(report);
     }
 }
 

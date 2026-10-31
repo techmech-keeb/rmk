@@ -66,7 +66,8 @@ impl Default for ConnectionStatus {
 }
 
 impl ConnectionStatus {
-    fn usb_ready(&self) -> bool {
+    /// Configured, or suspended but still reachable through remote wakeup.
+    pub fn usb_ready(&self) -> bool {
         matches!(self.usb, UsbState::Configured | UsbState::Suspended)
     }
 

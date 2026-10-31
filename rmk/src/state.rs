@@ -19,6 +19,42 @@ pub(crate) fn active_transport() -> Option<ConnectionType> {
     CONNECTION_STATUS.lock(|c| c.get().decide_active())
 }
 
+/// Whether the board's own link is up, as last reported through
+/// [`set_external_transport`].
+#[cfg(feature = "external_transport")]
+static EXTERNAL_CONNECTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Reports go to the board's own link while it is connected and USB is not
+/// ready. USB that is plugged in wins; the board's link wins over BLE.
+#[cfg(feature = "external_transport")]
+pub(crate) fn external_transport_active() -> bool {
+    external_carries(CONNECTION_STATUS.lock(|c| c.get()))
+}
+
+#[cfg(feature = "external_transport")]
+fn external_carries(status: ConnectionStatus) -> bool {
+    EXTERNAL_CONNECTED.load(core::sync::atomic::Ordering::Acquire) && !status.usb_ready()
+}
+
+/// Tell RMK whether the board's own report link
+/// ([`crate::channel::EXTERNAL_REPORT_CHANNEL`]) is connected. Whichever
+/// output stops carrying reports gets an all-up report of every type, as on
+/// any other transport flip.
+#[cfg(feature = "external_transport")]
+pub fn set_external_transport(connected: bool) {
+    let was = external_transport_active();
+    EXTERNAL_CONNECTED.store(connected, core::sync::atomic::Ordering::Release);
+    let now = external_transport_active();
+    if was && !now {
+        crate::channel::clear_and_release_external_report_channel();
+    } else if !was
+        && now
+        && let Some(previous) = active_transport()
+    {
+        crate::channel::clear_and_release_report_channel(previous);
+    }
+}
+
 /// Snapshot of the current connection status.
 ///
 /// Nothing is retained on [`ConnectionStatusChangeEvent`]: subscribe before reading
@@ -123,6 +159,11 @@ pub(crate) fn update_status(f: impl FnOnce(&mut ConnectionStatus)) {
 
     let prev_active = prev.decide_active();
     let new_active = new.decide_active();
+
+    #[cfg(feature = "external_transport")]
+    if external_carries(prev) && !external_carries(new) {
+        crate::channel::clear_and_release_external_report_channel();
+    }
 
     if prev_active != new_active
         && let Some(prev_active) = prev_active
@@ -230,6 +271,11 @@ mod tests {
 
     fn reset_state() {
         CONNECTION_STATUS.lock(|c| c.set(ConnectionStatus::default()));
+        #[cfg(feature = "external_transport")]
+        {
+            super::EXTERNAL_CONNECTED.store(false, core::sync::atomic::Ordering::Release);
+            crate::channel::EXTERNAL_REPORT_CHANNEL.clear();
+        }
         #[cfg(not(feature = "_no_usb"))]
         crate::channel::USB_REPORT_CHANNEL.clear();
         #[cfg(feature = "_ble")]
@@ -426,6 +472,75 @@ mod tests {
         set_usb_state(UsbState::Configured);
         assert_eq!(super::active_transport(), Some(ConnectionType::Usb));
         assert_all_released(&BLE_REPORT_CHANNEL);
+    }
+
+    #[cfg(feature = "external_transport")]
+    #[test]
+    fn external_link_carries_reports_while_usb_is_not_ready() {
+        use crate::channel::{EXTERNAL_REPORT_CHANNEL, try_send_hid_report};
+
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        try_send_hid_report(pressed_keyboard_report());
+        assert!(EXTERNAL_REPORT_CHANNEL.try_receive().is_err());
+
+        super::set_external_transport(true);
+        try_send_hid_report(pressed_keyboard_report());
+        assert!(matches!(EXTERNAL_REPORT_CHANNEL.try_receive(), Ok(Report::KeyboardReport(r)) if r.modifier == 0x02));
+    }
+
+    #[cfg(all(feature = "external_transport", not(feature = "_no_usb")))]
+    #[test]
+    fn usb_takes_over_from_the_external_link_and_releases_it() {
+        use crate::channel::{EXTERNAL_REPORT_CHANNEL, USB_REPORT_CHANNEL, try_send_hid_report};
+
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        super::set_external_transport(true);
+        EXTERNAL_REPORT_CHANNEL.try_send(pressed_keyboard_report()).unwrap();
+
+        set_usb_state(UsbState::Configured);
+        assert_all_released(&EXTERNAL_REPORT_CHANNEL);
+        try_send_hid_report(pressed_keyboard_report());
+        assert!(USB_REPORT_CHANNEL.try_receive().is_ok());
+        assert!(EXTERNAL_REPORT_CHANNEL.try_receive().is_err());
+
+        // Unplugging USB hands the reports back to the external link.
+        set_usb_state(UsbState::Disabled);
+        assert_all_released(&USB_REPORT_CHANNEL);
+        try_send_hid_report(pressed_keyboard_report());
+        assert!(EXTERNAL_REPORT_CHANNEL.try_receive().is_ok());
+    }
+
+    #[cfg(feature = "external_transport")]
+    #[test]
+    fn dropping_the_external_link_releases_it() {
+        use crate::channel::EXTERNAL_REPORT_CHANNEL;
+
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        super::set_external_transport(true);
+        EXTERNAL_REPORT_CHANNEL.try_send(pressed_keyboard_report()).unwrap();
+
+        super::set_external_transport(false);
+        assert_all_released(&EXTERNAL_REPORT_CHANNEL);
+    }
+
+    #[cfg(all(feature = "external_transport", feature = "_ble"))]
+    #[test]
+    fn the_external_link_takes_over_from_ble_and_releases_it() {
+        use crate::channel::{BLE_REPORT_CHANNEL, EXTERNAL_REPORT_CHANNEL, try_send_hid_report};
+        use crate::state::{BleState, set_ble_state};
+
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        set_ble_state(BleState::Connected);
+        BLE_REPORT_CHANNEL.try_send(pressed_keyboard_report()).unwrap();
+
+        super::set_external_transport(true);
+        assert_all_released(&BLE_REPORT_CHANNEL);
+        try_send_hid_report(pressed_keyboard_report());
+        assert!(EXTERNAL_REPORT_CHANNEL.try_receive().is_ok());
     }
 
     #[cfg(not(feature = "_no_usb"))]
