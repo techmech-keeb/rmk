@@ -27,10 +27,20 @@ use crate::light::UsbLedReader;
 use crate::state::{current_usb_state, set_usb_state};
 
 // The Rynk vendor interface serves the keyboard's Rynk session and the dongle's router.
+#[cfg(feature = "usb_diag")]
+pub mod diag;
 #[cfg(any(feature = "rynk", all(feature = "dongle", not(feature = "vial"))))]
 pub(crate) mod rynk;
 #[cfg(feature = "vial")]
 pub(crate) mod vial;
+
+/// Adds an event to the `usb_diag` log; compiles to nothing without it.
+macro_rules! diag {
+    ($event:expr) => {
+        #[cfg(feature = "usb_diag")]
+        diag::record($event, MULTIPLIERS_RAW.load(Ordering::Relaxed));
+    };
+}
 
 // A build has at most one host interface — Vial's HID report pair or the Rynk
 // vendor bulk pair, and the protocols are mutually exclusive. A dongle relays
@@ -721,6 +731,7 @@ impl RequestHandler for UsbCompositeRequestHandler {
         if id != ReportId::Feature(crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID) || buf.len() < 3 {
             return None;
         }
+        diag!(diag::UsbEvent::MultiplierGet);
         let raw = MULTIPLIERS_RAW.load(Ordering::Relaxed);
         buf[0] = crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID;
         buf[1] = raw & 1;
@@ -732,20 +743,36 @@ impl RequestHandler for UsbCompositeRequestHandler {
         if id != ReportId::Feature(crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID) {
             return OutResponse::Rejected;
         }
-        // Exactly the wire format of the numbered report: [id, wheel, pan]
-        // (HID 1.11 §8.1; embassy-usb hands the data stage over unmodified).
-        // Out-of-range values are rejected rather than clamped: silently
-        // coercing would let host and device disagree on the rate.
-        let [report_id, wheel, pan] = *data else {
-            return OutResponse::Rejected;
-        };
-        if report_id != crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID || wheel > 1 || pan > 1 {
-            return OutResponse::Rejected;
+        let response = set_multipliers(data);
+        #[cfg(feature = "usb_diag")]
+        {
+            let mut bytes = [0; 3];
+            let len = data.len().min(3);
+            bytes[..len].copy_from_slice(&data[..len]);
+            diag!(diag::UsbEvent::MultiplierSet {
+                data: bytes,
+                len: len as u8,
+                accepted: response == OutResponse::Accepted,
+            });
         }
-        MULTIPLIERS_RAW.store(wheel | (pan << 1), Ordering::Relaxed);
-        info!("Resolution multiplier set: wheel={} pan={}", wheel, pan);
-        OutResponse::Accepted
+        response
     }
+}
+
+fn set_multipliers(data: &[u8]) -> OutResponse {
+    // Exactly the wire format of the numbered report: [id, wheel, pan]
+    // (HID 1.11 §8.1; embassy-usb hands the data stage over unmodified).
+    // Out-of-range values are rejected rather than clamped: silently
+    // coercing would let host and device disagree on the rate.
+    let [report_id, wheel, pan] = *data else {
+        return OutResponse::Rejected;
+    };
+    if report_id != crate::hid::RESOLUTION_MULTIPLIER_REPORT_ID || wheel > 1 || pan > 1 {
+        return OutResponse::Rejected;
+    }
+    MULTIPLIERS_RAW.store(wheel | (pan << 1), Ordering::Relaxed);
+    info!("Resolution multiplier set: wheel={} pan={}", wheel, pan);
+    OutResponse::Accepted
 }
 
 // VENDOR PATCH (olsk60, hi-res scroll): a bus reset this soon after a resume
@@ -789,6 +816,7 @@ impl Handler for UsbDeviceHandler {
             info!("Device disabled");
             set_usb_state(UsbState::Disabled);
         }
+        diag!(diag::UsbEvent::Enabled(enabled));
     }
 
     fn reset(&mut self) {
@@ -809,11 +837,13 @@ impl Handler for UsbDeviceHandler {
         if !ends_suspend {
             reset_resolution_multipliers();
         }
+        diag!(diag::UsbEvent::Reset { kept: ends_suspend });
         info!("Bus reset, the Vbus current limit is 100mA");
     }
 
     fn addressed(&mut self, addr: u8) {
         info!("USB address set to: {}", addr);
+        diag!(diag::UsbEvent::Addressed(addr));
     }
 
     fn configured(&mut self, configured: bool) {
@@ -828,6 +858,7 @@ impl Handler for UsbDeviceHandler {
             set_usb_state(UsbState::Enabled);
             info!("Device is no longer configured, the Vbus current limit is 100mA.");
         }
+        diag!(diag::UsbEvent::Configured(configured));
     }
 
     fn suspended(&mut self, suspended: bool) {
@@ -862,10 +893,30 @@ impl Handler for UsbDeviceHandler {
                 "Device resumed, the Vbus current limit is 500µA (or 2.5mA for high-power devices with remote wakeup enabled)."
             );
         }
+        diag!(diag::UsbEvent::Suspended(suspended));
     }
 
     fn remote_wakeup_enabled(&mut self, enabled: bool) {
         info!("Remote wakeup enabled state: {}", enabled);
+        diag!(diag::UsbEvent::RemoteWakeup(enabled));
+    }
+
+    // Registered before every class, so this sees each delegated request
+    // first; it only records and lets the classes answer.
+    #[cfg(feature = "usb_diag")]
+    fn control_out(&mut self, req: embassy_usb::control::Request, _data: &[u8]) -> Option<OutResponse> {
+        diag!(diag::control(&req));
+        None
+    }
+
+    #[cfg(feature = "usb_diag")]
+    fn control_in<'a>(
+        &'a mut self,
+        req: embassy_usb::control::Request,
+        _buf: &'a mut [u8],
+    ) -> Option<embassy_usb::control::InResponse<'a>> {
+        diag!(diag::control(&req));
+        None
     }
 }
 
