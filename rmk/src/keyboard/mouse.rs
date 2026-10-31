@@ -229,12 +229,15 @@ impl MouseState {
 
         if self.wheel.has_active_direction() {
             let unit = self.calculate_wheel_unit(config);
-            let (pan, wheel) = self.wheel.axis_values(unit);
+            let (pan, down) = self.wheel.axis_values(unit);
+            // VENDOR PATCH (olsk60): `y` grows downward like the cursor, but a
+            // HID wheel is positive when rotated away from the user, which
+            // scrolls up. Pan already agrees: positive is right.
             // A wheel key always means whole detents: emit as many units as
             // the host negotiated for one, so hi-res does not shrink the step
             // a key press produces. Both multipliers are 1 until it does.
             let (wheel_res, pan_res) = crate::state::resolution_multipliers();
-            self.report.wheel = wheel.saturating_mul(wheel_res);
+            self.report.wheel = down.saturating_neg().saturating_mul(wheel_res);
             self.report.pan = pan.saturating_mul(pan_res);
         } else {
             self.report.wheel = 0;
@@ -485,6 +488,23 @@ mod test {
         assert_eq!(state.report.x, 0);
         state.process(HidKeyCode::MouseLeft, false, &config);
         assert!(state.report.x > 0, "Releasing Left should restore Right");
+    }
+
+    /// Wheel keys follow the HID convention the hosts scroll by: up is a
+    /// positive wheel, down negative, right a positive pan.
+    #[test]
+    fn wheel_keys_scroll_the_way_they_are_named() {
+        let config = default_config();
+        for (key, wheel, pan) in [
+            (HidKeyCode::MouseWheelUp, 1, 0),
+            (HidKeyCode::MouseWheelDown, -1, 0),
+            (HidKeyCode::MouseWheelRight, 0, 1),
+            (HidKeyCode::MouseWheelLeft, 0, -1),
+        ] {
+            let mut state = MouseState::new();
+            state.process(key, true, &config);
+            assert_eq!((state.report.wheel, state.report.pan), (wheel, pan), "{:?}", key);
+        }
     }
 
     #[test]
@@ -1043,12 +1063,14 @@ mod test {
 
     // -- N. Wheel sign convention tests ----------------------------------------
 
+    // VENDOR PATCH (olsk60): upstream asserts the opposite sign here; a
+    // negative wheel scrolls down on Windows and Linux.
     #[test]
-    fn wheel_up_sets_negative_wheel() {
+    fn wheel_up_sets_positive_wheel() {
         let mut state = MouseState::new();
         let config = default_config();
         state.process(HidKeyCode::MouseWheelUp, true, &config);
-        assert!(state.report.wheel < 0, "WheelUp should produce negative wheel");
+        assert!(state.report.wheel > 0, "WheelUp should produce positive wheel");
         assert_eq!(state.report.pan, 0);
     }
 
